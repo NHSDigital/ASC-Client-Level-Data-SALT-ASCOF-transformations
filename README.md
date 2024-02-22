@@ -10,15 +10,15 @@
 
 ## What is the purpose of these SQL codes?
 
-#### The codes are intended to replicate (wherever possible) the metrics previously captured in the Short and Long Term Support (SALT) collection, using the Client Level Data, where there is an ongoing need for this insight. The code processes have been written to be as true to the original principles of SALT as possible and filter, process, de-duplicate and aggregate the data in a way that closest matches SALT
+#### The codes are intended to replicate (wherever possible) the metrics previously captured in the Short and Long Term Support (SALT) collection, using the Client Level Data, where there is an ongoing need for this insight. The code processes have been written to be as true to the original principles of SALT as possible and filter, process, de-duplicate and aggregate the data in a way that closest matches SALT.
 
 
 ## How to apply them
 
-#### Field names must be changed 
+#### Database names, table names, field names etc will need to be changed to reflect those used locally. The codes were developed by NHS England using the access to the AGEM CLD Repository and as such the labels used reflect this. The principles of the base code should, however, be transferable once these adjustments are made.
 
 
 ## Known Limitations
 
-#### As a new data collection, with a change in the underlying source, metrics derived from CLD are not expected to perfectly match those from SALT (and a small number of fields in SALT Reproducing SALT and ASCOF metrics from Client Level Data were not carried over to the CLD specification). However, the approach outlined is intended to stay in linewith principles adopted by SALT. This guidance document is intended as a reference for users to describe thefields and methods used from CLD to reproduce the existing SALT metrics, as well as an indication of knownlimitations, since as per the CLD guidance sequels will be derived centrally by NHS England using standardisedtransformations from the sequence of events in a chronologically ordered data set, or by a terminating EventOutcome.
+#### As a new data collection, with a change in the underlying source, metrics derived from CLD are not expected to perfectly match those from SALT (and a small number of fields in SALT Reproducing SALT and ASCOF metrics from Client Level Data were not carried over to the CLD specification). However, the approach outlined is intended to stay in line with principles adopted by SALT. See the individual Limitations associated with each measure for more specific information
 
