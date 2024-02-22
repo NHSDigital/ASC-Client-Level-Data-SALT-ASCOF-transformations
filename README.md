@@ -1,21 +1,24 @@
 # Adult Social Care Client Level Data
 
-## What is Client Level Data
+## What is Client Level Data?
 
-#### Adult Social Care CLient Level  Data (CLD) is.....
+#### Adult Social Care CLient Level  Data (CLD) is a data product is created from data submitted to NHS England by Arden & GEM (AGEM) who collect the data from local authorities on a quarterly basis. This is then transferred to NHS England where data is pseudonymised centrally and made available to request through the Data Access Request Service (DARS). It contains data relating to adults over 18 who are receiving social care services, informal carers and events where the care is provided or arranged by the local authority. 
+
+
+#### Following a 12-month period of dual running in 2023/24, CLD will replace the Short and Long Term (SALT) collection in 2024/25. CLD is seen as an evolution of the SALT return, containing more granular detail and timeliness to allow for more flexible and broader analytical use.
 
 
 ## What is the purpose of these SQL codes?
 
-#### These SQL scripts are to be used.....
+#### The codes are intended to replicate (wherever possible) the metrics previously captured in the Short and Long Term Support (SALT) collection, using the Client Level Data, where there is an ongoing need for this insight. The code processes have been written to be as true to the original principles of SALT as possible and filter, process, de-duplicate and aggregate the data in a way that closest matches SALT
 
 
 ## How to apply them
 
-#### Syntax must be changed according to .....
+#### Field names must be changed 
 
 
 ## Known Limitations
 
-#### there are known limitations regarding these scripts .....
+#### As a new data collection, with a change in the underlying source, metrics derived from CLD are not expected to perfectly match those from SALT (and a small number of fields in SALT Reproducing SALT and ASCOF metrics from Client Level Data were not carried over to the CLD specification). However, the approach outlined is intended to stay in linewith principles adopted by SALT. This guidance document is intended as a reference for users to describe thefields and methods used from CLD to reproduce the existing SALT metrics, as well as an indication of knownlimitations, since as per the CLD guidance sequels will be derived centrally by NHS England using standardisedtransformations from the sequence of events in a chronologically ordered data set, or by a terminating EventOutcome.
 
