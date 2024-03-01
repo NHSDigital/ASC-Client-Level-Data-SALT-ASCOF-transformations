@@ -6,7 +6,8 @@
 /*This version of the STS001 code applies the logic of searching the chronology for all Request records in the 
 first instance and only after this defaulting back to the Event Outcome where appropriate.
 
-The ST-MAX cohort for STS002a is also created and staged into a table as part of this code process
+The ST-MAX cohort for STS002a is also created and staged into a table as part of this code process (see Row 749 where 
+Table Name needs defining)
 */
 
 
@@ -745,7 +746,7 @@ drop table IF EXISTS [ASC_Sandbox].[SALT_STS002a_Cohort]
 select distinct a.LA_CODE, a.[ID], a.Cluster_Start_Date, a.Cluster_End_Date, a.Event_Outcome,  a.REQUEST_COUNT
 , a.Sequel_Event_Start_Date
 , a.Sequel_Service_Type as [FINAL_OUTCOME]
-into [ASC_Sandbox].[SALT_STS002a_Cohort] --Write as a permanent table to be used as the STS002 ST-Max cohort
+into [TABLE NAME] --Write as a permanent table to be used as the STS002 ST-Max cohort
 from #REQUESTS_WITH_BREAKS a
 inner join
 (
