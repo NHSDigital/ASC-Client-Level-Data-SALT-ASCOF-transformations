@@ -3,7 +3,7 @@ cohort fed directly from the STS001 (New Client Requests) table, where sequel to
 creating first, this can be done by running the accompanying STS001 SQL script and following the instructions.
 
 The methodology used by the SQL script is to find completed ST-Max episodes within the period of interest and then search through the subsequent 
-Event activity for the Client in question, to ascertain what followed the ST-Max episode. See Transformation Principles document for more detailed 
+Event activity for the Client in question, to ascertain what followed the ST-Max episode. See Transformation Principles document for high level 
 step-by-step methodology.
 
 Invalid Event Outcomes (as per CLD spec) may affect the performance of the script and the accuracy of the sequel allocation. Especially NULL values 
