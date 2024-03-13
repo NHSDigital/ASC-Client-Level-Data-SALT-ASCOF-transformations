@@ -15,7 +15,7 @@
 
 ## How to apply them
 
-#### Database names, table names, field names etc will need to be changed to reflect those used locally. The codes were developed by NHS England using the access to the AGEM CLD Repository and as such the labels used reflect this. The principles of the base code should, however, be transferable once these adjustments are made.
+#### The codes were developed by NHS England using the access to the AGEM CLD Repository and as such the labels used reflect this (Database names, table names, field names). The principles of the base code should, however, be transferable once these adjustments are made.
 
 
 ## Known Limitations
