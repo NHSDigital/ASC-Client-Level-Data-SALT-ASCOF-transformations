@@ -1,0 +1,537 @@
+------------------------------------------------------------
+/*CODE TO RE-CREATE LTS001a: TABLES 1A, 1B*/
+------------------------------------------------------------
+
+/* Final data tables are saved as:
+
+#LTS001a_T1a_Final
+#LTS001a_T1b_Final
+
+
+Queries of these tables, written in a way to extract for SALT, are included in this script at the end 
+of each respective table build in turn
+*/
+
+
+---------------------------------------------------------------------------------------------------
+/*CREATE REFERENCE TABLE #REF_SERVICE_TYPE_DELIVERY_MECH TO CATEGORISE AND RANK ITEMS FOR LTS001a*/
+---------------------------------------------------------------------------------------------------
+--NOTE: Check periodically to ensure the Defined List in CLD spec has not changed!
+drop table if exists #REF_Service_Type_Delivery_Mech
+create table #REF_Service_Type_Delivery_Mech
+(Service_Type varchar(200)
+,Delivery_Mechanism varchar(200)
+,SALT_Category varchar(200)
+,SALT_Broad_Category varchar(200)
+,Sort_Order int
+,Hierarchy int)
+
+insert into #REF_Service_Type_Delivery_Mech
+(Service_Type
+,Delivery_Mechanism
+,SALT_Category
+,SALT_Broad_Category
+,Sort_Order
+,Hierarchy
+)
+values
+('Long Term Support: Nursing Care', '', 'Nursing', 'Nursing', 1, 1)
+,('Long Term Support: Residential Care', '', 'Residential', 'Residential', 2, 2)
+,('Long Term Support: Community', 'Direct Payment', 'Community: Direct Payment', 'Community', 3, 3)
+,('Long Term Support: Community', 'CASSR Managed Personal Budget', 'Community: CASSR Managed Personal Budget', 'Community', 4, 4)
+,('Long Term Support: Community', 'CASSR Commissioned Support', 'Community: CASSR Commissioned Support', 'Community', 5, 5)
+,('Long Term Support: Community', '', 'Community', 'Community', 6, 6)
+,('Long Term Support: Prison', 'CASSR Managed Personal Budget', 'Prison: CASSR Managed Personal Budget', 'Prison', 7, 7)
+,('Long Term Support: Prison', 'CASSR Commissioned Support', 'Prison: CASSR Commissioned Support', 'Prison', 8, 8)
+,('Long Term Support: Prison', '', 'Prison', 'Prison', 9, 9)
+;
+
+
+
+-------------------------------------------------------------------------------------------
+/*CREATE REFERENCE TABLE #REF_PSR TO ENSURE ONLY VALID PSRs COME THROUGH INTO FINAL TABLE*/
+-------------------------------------------------------------------------------------------
+--NOTE: Check periodically to ensure the Defined List in CLD spec has not changed!
+drop table if exists #REF_PSR
+create table #REF_PSR
+(Primary_Support_Reason varchar(200))
+;
+
+
+insert into #REF_PSR
+(Primary_Support_Reason
+)
+values
+('Physical Support: Access & mobility only')
+,('Physical Support: Personal care support')
+,('Sensory Support: Support for visual impairment')
+,('Sensory Support: Support for hearing impairment')
+,('Sensory Support: Support for dual impairment')
+,('Support with Memory & Cognition')
+,('Learning Disability Support')
+,('Mental Health Support')
+,('Social Support: Substance misuse support')
+,('Social Support: Asylum seeker support')
+,('Social Support: Support for Social Isolation/Other')
+,('Social Support: Support to Carer')
+,('Unknown')
+;
+
+
+
+
+--------------------------------------------------------------------------
+/*CREATE TABLE RETURNING LATEST SUBMISSION WITHIN THE PERIOD OF INTEREST*/
+--------------------------------------------------------------------------
+/*
+This code uses a procedure at the beginning to determine the last file submission
+from each LA within the window, on the understanding that this was a Final and complete submission.
+
+This process helps to cut down on duplicates and also ensure that the latest edition of each Event is selected.
+Because the CLD submissions append/stack and no old data is deleted, then without running a process such as this below previous 
+iterations of old events that have subsequently been updated and/or closed will come through 
+e.g an event entered onto the system in 2022 showing as open (no Event End Date) will pass through the date filters later on in the process
+despite a more recent LA submission in 2024 showing that the same Event ended/closed in 2023.
+
+Set the date parameters for period of interest at the end of the query as per the annotated instructions
+*/
+
+drop table if exists #Latest_Submission
+  SELECT DISTINCT
+    LA_Name,
+    ImportDate
+     INTO #Latest_Submission
+  FROM (
+    SELECT
+      *,
+      ROW_NUMBER() OVER(PARTITION BY LA_Name, LA_Code ORDER BY ImportDate DESC) row
+    FROM (
+      SELECT
+        LA_Name,
+        LA_Code,
+        ImportDate,
+        MIN(Reporting_Period_Start_Date) Reporting_Period_Start_Date,
+        MAX(Reporting_Period_End_Date) Reporting_Period_End_Date
+ 
+	  FROM [DHSC_ASC].[CLD_R1_Raw]
+	  	  WHERE LA_Name IS NOT NULL
+      GROUP BY
+        LA_Name,
+        LA_Code,
+        ImportDate
+    ) a
+    WHERE Reporting_Period_Start_Date <= '2023-04-01' --beginning of Q1 of year of interest (always 1st April where snapshot or in-year)
+    AND Reporting_Period_End_Date >= '2023-12-31' --end of period of interest (enter snapshot date here if snapshot required)
+    AND ImportDate > '2023-12-31' --should be after the Reporting Period End Date (when LAs can submit data from)
+    AND CONVERT(date, ImportDate) <= '2024-03-01' --user can specify how late submissions can be accepted from (submission window closes 1month after quarter end)
+  ) b
+  WHERE row = 1
+
+/*
+Worked Example:
+
+For 2023/24 SALT publications
+The 'in-year' i.e. whole financial year period 23/24 (e.g. for LTS001a) 
+and also the snapshot 31st March 2024 (e.g. for LTS001b)
+would be 
+
+    WHERE Reporting_Period_Start_Date <= '2023-04-01'
+    AND Reporting_Period_End_Date >= '2024-03-31'
+    AND ImportDate > '2024-04-31'
+    AND CONVERT(date, ImportDate) <= '2024-05-01'
+
+*/
+
+
+
+
+
+
+--------------------------------------------------------------------------------------
+/*FILTER DATA APPROPRIATELY FOR LTS001a INDIVIDUALS AND SELECT SALT REPORTING PERIOD*/
+--------------------------------------------------------------------------------------
+DECLARE
+  @StartDate DATE,
+  @EndDate DATE
+;
+
+SET @StartDate = '2023-04-01' -- Complete as required
+SET @EndDate = '2023-12-31' -- Complete as required
+;
+
+
+drop table if exists #LTS001a_Build
+select a.*
+, CAST((concat(Der_Birth_Year, '-', Der_Birth_Month, '-', '01')) as DATE) as [Der_DOB] -- Derived using 1st month as an arbitrary date
+, FLOOR((DATEDIFF (DAY, (CAST(concat(Der_Birth_Year, '-', Der_Birth_Month, '-', '01') as DATE)), @EndDate))/365.25) as [Der_Age_EndDate]-- Derived age as at period end, using Der_DOB
+, Case when Primary_Support_Reason = 'Unknown' or Primary_Support_Reason is NULL then 0 else 1 end as [Der_PSR_Known] --used to preference rows as part of de-duplication 
+into #LTS001a_Build
+from [DHSC_ASC].[CLD_R1_Raw] a
+inner join #Latest_Submission b on a.LA_Name = b.LA_Name and a.ImportDate = b.ImportDate
+where [Service_Type] in ('Long Term Support: Nursing Care', 'Long Term Support: Residential Care', 'Long Term Support: Community', 'Long Term Support: Prison')
+and Client_Type = 'Service User'
+and Event_Start_Date <= @EndDate
+and (Event_End_Date >= @StartDate or Event_End_Date is NULL)
+and (Date_of_Death >= @StartDate OR Date_of_Death is NULL) 
+and (Der_Birth_Month is not NULL and Der_Birth_Year is not NULL) --Only small amount currently but they stop the CAST functions from working. See query below to extract and analyse Unknowns
+;
+
+
+
+--/*Staging table allowing for analysis of Unknown Age records*/
+--drop table if exists #LTS001a_UnknownAges
+--select *
+--into #LTS001a_UnknownAges
+--from [DHSC_ASC].[CLD_R1_Raw]
+--where [Service_Type] in ('Long Term Support: Nursing Care', 'Long Term Support: Residential Care', 'Long Term Support: Community', 'Long Term Support: Prison')
+--and Client_Type = 'Service User'
+--and Event_Start_Date <= @EndDate
+--and (Event_End_Date >= @StartDate or Event_End_Date is NULL)
+--and (Date_of_Death >= @StartDate OR Date_of_Death is NULL) 
+--and (Der_Birth_Month is NULL or Der_Birth_Year is NULL)
+--;
+
+
+
+
+
+-----------------------------------------
+/*CREATE AMALGAMATED NHS/LA IDENTIFIER*/
+-----------------------------------------
+/*initially, find all individuals with an NHS Number and stage into a temporary table*/                              
+drop table if exists #uniquenhs
+SELECT DISTINCT Der_Unique_Record_ID, Der_NHS_Number_Traced_Pseudo, Der_LA_Person_Unique_Identifier_Pseudo, 'NHS' as [Source]                                                                                                                                                     
+INTO #uniquenhs                                                                                                                                                           
+FROM #LTS001a_Build                                                                                                                                              
+where Der_NHS_Number_Traced_Pseudo is not NULL                                                                                          
+;
+
+
+/*where the NHS Number is missing, pull through all individuals LA Unique ID
+except in those cases where the LA Unique ID is already present and associated with an individual in #uniquenhs*/
+drop table if exists #missingnhs
+SELECT distinct a.Der_Unique_Record_ID, a.Der_NHS_Number_Traced_Pseudo, a.Der_LA_Person_Unique_Identifier_Pseudo, 'LA' as [Source]                                                                             
+INTO #missingnhs                                                                                                                                                           
+FROM #LTS001a_Build a                                                                                                                                                
+left join #uniquenhs b on a.Der_LA_Person_Unique_Identifier_Pseudo = b.Der_LA_Person_Unique_Identifier_Pseudo                                                                                                          
+where a.Der_NHS_Number_Traced_Pseudo is NULL                                                                                              
+and b.Der_LA_Person_Unique_Identifier_Pseudo is NULL                                                                                     
+;
+
+
+/*Stack the NHS IDs and the LA IDs from the two temp tables underneath each other in a final table, as an amalgamated 'ID' field*/
+drop table if exists #FINAL
+select distinct Der_Unique_Record_ID, Der_NHS_Number_Traced_Pseudo as [ID], [Source]                                     
+into #FINAL                                                                                                                                                                     
+from #uniquenhs                                                                                                                                                           
+UNION                                                                                                                                                               
+select distinct Der_Unique_Record_ID, Der_LA_Person_Unique_Identifier_Pseudo as [ID], [Source]                        
+from #missingnhs
+;
+
+
+/*Add a column to Raw table with the new ID field*/
+alter table #LTS001a_Build add [ID] nvarchar (200)
+GO
+;
+update a
+set a.[ID] = b.[ID]
+from #LTS001a_Build a left join #FINAL b on a.Der_Unique_Record_ID = b.Der_Unique_Record_ID
+;
+
+
+/*delete rows from table where [ID] is NULL
+These records can not be assigned to an individual with 100% accuracy and without the risk of double-counting 
+as the NHS ID is NULL and the LA ID is already present in the data associated to an NHS Number*/
+delete from #LTS001a_Build
+where [ID] is NULL
+;
+
+
+
+/*Create raw table*/
+drop table if exists #LTS001a_Raw
+select *
+into #LTS001a_Raw
+from #LTS001a_Build
+
+
+
+----------------------------------------------------------------------------------------------------------------
+
+
+
+-----------------------------------------------------------------------------------------
+/*OVER-WRITE ANY INVALID OR UNEXPECTED ENTRIES IN THE DELIVERY MECHANISM COLUMN TO ''  */
+-----------------------------------------------------------------------------------------
+--Delivery Mechanism is currently NOT a mandatory field and so we can not remove records based on inaccuracy in this field
+--but leaving invalid/unexpected entries in the field will cause problems with the Reference data join. 
+--Solution to this is to blank out ('') any entries that are invalid or where a Delivery Mechanism is not expected (Nursing and Res events)
+update a
+set a.Delivery_Mechanism = 
+(CASE WHEN b.Delivery_Mechanism is not NULL and a.Service_Type in ('Long Term Support: Community', 'Long Term Support: Prison') then a.Delivery_Mechanism 
+	  ELSE '' 
+	  end)
+from #LTS001a_Raw a
+left join #REF_Service_Type_Delivery_Mech b on trim (a.[Service_type]) = trim (b.[Service_Type])
+and trim (a.Delivery_Mechanism) = trim (b.[Delivery_Mechanism])
+;
+
+
+
+
+----------------------------------------------------------------------------
+/*TABLE 1a INITIAL BUILD: AGED 18-64 BY PSR AND SETTING/DELIVERY MECHANISM*/
+----------------------------------------------------------------------------
+--Create T1a table and add relevant fields from Reference data
+drop table if exists #LTS001a_T1a
+select a.*
+,b.[Sort_Order]
+,b.[Hierarchy]
+into #LTS001a_T1a
+from #LTS001a_Raw a
+left join #REF_Service_Type_Delivery_Mech b on trim (a.[Service_type]) = trim (b.[Service_Type])
+and trim (a.Delivery_Mechanism) = trim (b.[Delivery_Mechanism])
+where Der_Age_EndDate between 18 and 64 -- Using the Derived Age field created from Month and Year of Birth
+;
+
+
+
+------------------------------------------------------
+/*TABLE 1a PROCESSING, FILTERING AND DE-DUPLICATION*/
+------------------------------------------------------
+
+/* In SALT each Client can only be counted once in each LTS table so de-duplication routines are needed to achieve this. 
+Code below chooses the record with the lowest 'Rank' in Service_Type/Delivery_Mech Hierarchy as per the REF data
+and also tries to deal with instances of multiple PSR on the same ID. This is done by selecting Known PSRs over Unknown
+and then from these the PSR on the most recent EVENT_START_DATE*/
+
+
+--The code has to work in this specific sequence in order to be correct:
+--1. For each combination of PSR, Service Type and Delivery Mech - choose the lowest Hierarchy against each ID
+-- and then of this cohort
+--2. Choose only Known PSR records in instances where both a Known and an Unknown exist for same LTS event (if only Unknowns exist keep these)
+-- and then of this cohort
+--3. Select the latest Event Start Date
+
+
+--4. If any duplicate PSRs are still present in rows with identical ID, Hierarchy, Event Start Date and Import Date, default each instance to Unknown PSR
+
+-- with this final cohort count the IDs by LA, PSR, Service Type and Delivery Mech
+
+
+
+--1. Pull out lowest Hierarchy / 'RANK' (a Nursing setting 'trumps' Community setting etc for the same client)
+drop table if exists #LTS001a_T1a_MinRank
+SELECT LA_Code, [ID], Min(Hierarchy) as [RANK]
+into #LTS001a_T1a_MinRank
+FROM #LTS001a_T1a
+GROUP BY LA_Code, [ID]
+;
+
+
+
+--2. Select only records with a Known PSR if both Known and Unknown exist on same [ID] from cohort 1.
+--   (code takes the highest 'Der_PSR_Known' flag where 0 = Unknown and 1 = Known)
+drop table if exists #LTS001a_T1a_PSR_Known
+SELECT a.LA_Code, b.[ID], b.[RANK], Max(DER_PSR_Known) as [MaxPSRKnown]
+into #LTS001a_T1a_PSR_Known
+FROM #LTS001a_T1a a
+left join #LTS001a_T1a_MinRank b on a.LA_CODE = b.LA_CODE and a.[ID] = b.[ID] and a.Hierarchy = b.[RANK]
+where 
+b.[ID] is not NULL
+GROUP BY a.LA_Code, b.[ID], b.[RANK]
+;
+
+
+--3. Select the latest Event Start Date of the records from cohort 2.
+drop table if exists #LTS001a_T1a_COMBINED
+SELECT a.LA_Code, b.[ID], [RANK], [MaxPSRKnown], max(Event_Start_Date) as [MaxDate]
+into #LTS001a_T1a_COMBINED
+FROM #LTS001a_T1a a
+left join #LTS001a_T1a_PSR_Known b on a.LA_CODE = b.LA_CODE and a.[ID] = b.[ID] and a.Hierarchy = b.[RANK] and a.Der_PSR_Known = b.[MaxPSRKnown]
+where 
+b.[ID] is not NULL
+group by a.LA_Code, b.[ID], [RANK], [MaxPSRKnown]
+;
+
+
+
+
+-- Pull through all the PSR, Service Type and Delivery Mech information for each [ID] in the Combined table
+-- as part of this, now over-write any Invalid (as per the spec) or NULL PSRs as 'Invalid/Null'
+drop table if exists #LTS001a_T1a_Final_Staging
+select a.LA_CODE,b.Service_Type, b.Delivery_Mechanism
+, CASE WHEN c.Primary_Support_Reason is NULL then 'Invalid/NULL' else c.Primary_Support_Reason END as 'Primary_Support_Reason'
+, a.[ID]
+into #LTS001a_T1a_Final_Staging
+from #LTS001a_T1a_COMBINED a 
+left join #LTS001a_T1a b on a.LA_Code = b.LA_CODE and a.[ID] = b.[ID] and a.[RANK] = b.[Hierarchy] and a.MaxPSRKnown = b.Der_PSR_Known and a.MaxDate = b.Event_Start_Date
+left join #REF_PSR c on b.Primary_Support_Reason = c.Primary_Support_Reason
+group by a.LA_CODE, b.Service_Type, b.Delivery_Mechanism
+, CASE WHEN c.Primary_Support_Reason is NULL then 'Invalid/NULL' else c.Primary_Support_Reason END
+, a.[ID]
+;
+
+
+
+
+-- Build a table of Duplicate records - at this stage after the previous de-duplication procedures 1-3 above this will be records
+-- that are identical for the purposes of LTS001a apart from having conflicting PSRs
+drop table if exists #T1a_PSR_Duplicates
+select LA_CODE, Service_Type, Delivery_Mechanism, [ID], count([ID]) as [COUNT]
+into #T1a_PSR_Duplicates
+from #LTS001a_T1a_Final_Staging
+group by LA_CODE, Service_Type, Delivery_Mechanism, [ID]
+having count([ID]) > 1
+;
+
+
+-- Create Final LTS001a Table 1a
+-- PSR is altered as part of the build to over-write any conflicting PSRs to 'Unknown' in all instances
+drop table if exists #LTS001a_T1a_Final
+select distinct 
+a.LA_CODE
+, CASE When b.[COUNT] is not NULL then 'Unknown' else a.Primary_Support_Reason End as [Primary_Support_Reason]
+, a.Service_Type
+, a.Delivery_Mechanism
+, a.[ID]
+into #LTS001a_T1a_Final
+from #LTS001a_T1a_Final_Staging a
+left join #T1a_PSR_Duplicates b on a.LA_code = b.LA_Code and a.Service_Type = b.Service_Type and a.Delivery_Mechanism = b.Delivery_Mechanism and a.[ID] = b.[ID]
+;
+
+
+
+
+-------------------------------
+/*PRODUCE COUNTS FOR TABLE 1a*/
+-------------------------------
+select LA_CODE, Primary_Support_Reason, Service_Type, Delivery_Mechanism, count(distinct [ID])
+from #LTS001a_T1a_Final
+group by LA_CODE, Primary_Support_Reason, Service_Type, Delivery_Mechanism
+order by LA_CODE
+;
+
+
+-----------------------------------------------------------------------------------------------------------------------------
+
+
+
+
+
+--------------------------------------------------------------------------
+/*TABLE 1b INITIAL BUILD: AGED 65+ BY PSR AND SETTING/DELIVERY MECHANISM*/
+--------------------------------------------------------------------------
+--Create T1b table and add relevant fields from Reference data
+drop table if exists #LTS001a_T1b
+select a.*
+,b.[Sort_Order]
+,b.[Hierarchy]
+into #LTS001a_T1b
+from #LTS001a_Raw a
+left join #REF_Service_Type_Delivery_Mech b on trim (a.[Service_type]) = trim (b.[Service_Type])
+and trim (a.Delivery_Mechanism) = trim (b.[Delivery_Mechanism])
+where Der_Age_EndDate > 64 -- Using the Derived Age field created from Month and Year of Birth
+;
+
+
+
+------------------------------------------------------
+/*TABLE 1b PROCESSING, FILTERING AND DE-DUPLICATION*/
+------------------------------------------------------
+--SEE annotation for Table 1a above for details of full rationale
+
+--1. Pull out lowest Hierarchy / 'RANK'
+drop table if exists #LTS001a_T1b_MinRank
+SELECT LA_Code, [ID], Min(Hierarchy) as [RANK]
+into #LTS001a_T1b_MinRank
+FROM #LTS001a_T1b
+GROUP BY LA_Code, [ID]
+;
+
+
+--2. Select only records with a Known PSR if both Known and Unknown exist on same [ID] from cohort 1.
+--   (code takes the highest 'Der_PSR_Known' flag where 0 = Unknown and 1 = Known)
+drop table if exists #LTS001a_T1b_PSR_Known
+SELECT a.LA_Code, b.[ID], b.[RANK], Max(DER_PSR_Known) as [MaxPSRKnown]
+into #LTS001a_T1b_PSR_Known
+FROM #LTS001a_T1b a
+left join #LTS001a_T1b_MinRank b on a.LA_CODE = b.LA_CODE and a.[ID] = b.[ID] and a.Hierarchy = b.[RANK]
+where 
+b.[ID] is not NULL
+GROUP BY a.LA_Code, b.[ID], b.[RANK]
+;
+
+
+--3. Select the latest Event Start Date of the records from cohort 2.
+drop table if exists #LTS001a_T1b_COMBINED
+SELECT a.LA_Code, b.[ID], [RANK], [MaxPSRKnown], max(Event_Start_Date) as [MaxDate]
+into #LTS001a_T1b_COMBINED
+FROM #LTS001a_T1b a
+left join #LTS001a_T1b_PSR_Known b on a.LA_CODE = b.LA_CODE and a.[ID] = b.[ID] and a.Hierarchy = b.[RANK] and a.Der_PSR_Known = b.[MaxPSRKnown]
+where 
+b.[ID] is not NULL
+group by a.LA_Code, b.[ID], [RANK], [MaxPSRKnown]
+;
+
+
+
+-- Pull through all the PSR, Service Type and Delivery Mech information for each [ID] in the Combined table
+-- as part of this, now over-write any Invalid (as per the spec) or NULL PSRs as 'Invalid/Null'
+-- as leaving these populated causes duplicates to pull through into the final table
+drop table if exists #LTS001a_T1b_Final_Staging
+select a.LA_CODE, b.Service_Type, b.Delivery_Mechanism
+, CASE WHEN c.Primary_Support_Reason is NULL then 'Invalid/NULL' else c.Primary_Support_Reason END as 'Primary_Support_Reason'
+, a.[ID]
+into #LTS001a_T1b_Final_Staging
+from #LTS001a_T1b_COMBINED a 
+left join #LTS001a_T1b b on a.LA_Code = b.LA_CODE and a.[ID] = b.[ID] and a.[RANK] = b.[Hierarchy] and a.MaxPSRKnown = b.Der_PSR_Known and a.MaxDate = b.Event_Start_Date
+left join #REF_PSR c on b.Primary_Support_Reason = c.Primary_Support_Reason
+group by a.LA_CODE, b.Service_Type, b.Delivery_Mechanism
+, CASE WHEN c.Primary_Support_Reason is NULL then 'Invalid/NULL' else c.Primary_Support_Reason END
+, a.[ID]
+;
+
+
+-- Build a table of Duplicate records - at this stage after the previous de-duplication procedures 1-3 above this will be records
+-- that are identical for the purposes of LTS001a apart from having conflicting PSRs
+drop table if exists #T1b_PSR_Duplicates
+select LA_CODE, Service_Type, Delivery_Mechanism, [ID], count([ID]) as [COUNT]
+into #T1b_PSR_Duplicates
+from #LTS001a_T1b_Final_Staging
+group by LA_CODE, Service_Type, Delivery_Mechanism, [ID]
+having count([ID]) > 1
+;
+
+
+-- Create Final LTS001a Table 1b
+-- PSR is altered as part of the build to over-write any conflicting PSRs to 'Unknown' in all instances
+drop table if exists #LTS001a_T1b_Final
+select distinct 
+a.LA_CODE
+, CASE When b.[COUNT] is not NULL then 'Unknown' else a.Primary_Support_Reason End as [Primary_Support_Reason]
+, a.Service_Type
+, a.Delivery_Mechanism
+, a.[ID]
+into #LTS001a_T1b_Final
+from #LTS001a_T1b_Final_Staging a
+left join #T1b_PSR_Duplicates b on a.LA_code = b.LA_Code and a.Service_Type = b.Service_Type and a.Delivery_Mechanism = b.Delivery_Mechanism and a.[ID] = b.[ID]
+;
+
+
+-------------------------------
+/*PRODUCE COUNTS FOR TABLE 1b*/
+-------------------------------
+select LA_CODE, Primary_Support_Reason, Service_Type, Delivery_Mechanism, count(distinct [ID])
+from #LTS001a_T1b_Final
+group by LA_CODE, Primary_Support_Reason, Service_Type, Delivery_Mechanism
+order by LA_CODE
+
+
+-------
+/*END*/
+-------
+
+
+

@@ -1,0 +1,19 @@
+As with all measures, the process is reliant on LAs accurately capturing fields as per the relevant specification defined lists. Any fields that are invalid as per the CLD specification are removed from the analysis – source data will not be corrected and invalid field entries cannot be mapped to the specification.  All invalid field entries are flagged and captured in the Data Quality Reports received by LAs to highlight areas to be corrected in future submissions. 
+
+This script uses a series of logic designed to remain as true to the principles of SALT as possible. The ST-Max events that the code uses is taken from the cohort fed directly from the STS001 (New Client Requests) table, where sequel to Request for support was identified as ST-Max. The STS001 cohort needs creating first. This can be done by running the accompanying STS001 SQL script and following the instructions in the code annotation.
+
+The methodology used by the SQL script is to find completed ST-Max episodes within the period of interest and then search through the subsequent Event activity for the Client in question, to ascertain what followed the ST-Max episode. See Transformation Principles document for high level step-by-step methodology.
+
+Invalid Event Outcomes (as per CLD spec) may affect the performance of the script and the accuracy of the sequel allocation. Especially NULL values in the Event Outcome field – these will lead to some joins not working correctly when code is LEFT JOINing a NULL value to a NULL value
+
+This code in current form produces sequels to ST-Max events, by SALT category (as per STS002a) and LA. To produce the further breakdowns by Route Of Access, Primary Support Reason and Ethnicity for Tables 1-4, the relevant fields will need to be added to the SELECT field list of table build #ST_MAX_BUILD and pulled through into subsequent table builds after this
+
+Full Early cessation of service is not possible to derive from CLD (as per the guidance) and as such these categories will not be fully represented in the sequel outputs
+
+Code is written as at Q3 for 2023/24, the latest submission as per time of creation. Date filters can be amended as needed, making sure to check that ALL dates all the way down the code scripts have been amended in-line with the period of interest (i.e. ‘Start Date’, ‘End Date’ and also occasionally ‘Import Date’ filters) 
+
+As part of a process to find the latest edition of each Event within the historical data, a new ‘EVENT ID’ is created within the script. This is used to avoid old versions of Events (from previous submissions) still showing as open and thus potentially falling in scope of the period of interest when a later version of the same record has been marked as closed and NOT in scope of the period of interest. The newly-created EVENT ID uses a concatenation of numerous fields within CLD, where rows with a complete match indicate the same Event. This logic has been found to be more robust when applied across all LAs than taking the Event Reference Number (ERN) within CLD at face value.
+
+NHS Number is used as a unique identifier for each Client wherever possible. Where NHS number is not populated the Local Authority unique ID is used instead, if this can be done without compromising accuracy. In instances where no ID can be attributed to an event row without introducing the risk of either double-counting or incorrect allocation of identifiers to individuals, these event rows will be removed from the headcount (see Glossary of key concepts for further information). 
+
+Any Reference Data tables needed for the process are built as temporary tables in the script. These can alternatively be built as permanent tables if the environment the code is being run in allows. These Reference tables should periodically be checked against the Client Level Data Specification to ensure the Defined Lists haven’t changed and labels are still up-to-date

@@ -1,0 +1,859 @@
+
+---------------------------------
+/*ASCOF 2A REPLICATION CODE*/
+---------------------------------
+
+/*
+ASCOF 2A: The proportion of people who received short-term services during the year - who previously were not receiving services - where no further request 
+was made for ongoing support (formerly metric 2D)
+
+
+
+PLEASE READ:
+
+This script uses a series of code logic designed to remain as true to the principles of SALT-derived ASCOF measure as possible. The ST-Max Events the code
+uses is the cohort fed directly from the STS001 (New Client Requests) table, where sequel to Request for support was identified as ST-Max
+
+The code must run SALT STS002a script all the way through in order to determine the sequels to the ST-Max events as accurately as possible and build the
+Numerator and Denominator from these outcomes at the end
+
+The STS001 cohort will need creating first, this can be done by running the accompanying STS001 SQL script
+
+Invalid Event Outcomes (as per CLD spec) may affect the performance of the script and the accuracy of the sequel allocation
+Especially NULL values in the Event Outcome field, these will lead to some joins not working correctly when code is left joining a NULL value to a NULL value
+
+
+------------------------------------------------
+
+
+DENOMINATOR - All ST-Max events with a sequel of:
+- Long Term Support (any setting)
+- Ongoing Low Level Support
+- Short Term Support (other)
+- No Services Provided – Universal Services / signposted to other services
+- No services provided – other
+
+
+NUMERATOR - All ST-Max events with a sequel of:
+- Ongoing Low Level Support
+- Short Term Support (other)
+- No Services Provided – Universal Services / signposted to other services
+- No services provided – other
+
+
+OUTCOME - NUMERATOR / DENOMINATOR * 100
+
+*/
+
+
+
+
+-----------------------------------------------------------------------------------------------------------
+/*CREATE REFERENCE TABLE #REF_SERVICE_TYPE_DELIVERY_MECH TO CATEGORISE AND RANK SERVICE ITEMS FOR SEQUELS*/
+-----------------------------------------------------------------------------------------------------------
+--NOTE: Check periodically to ensure the Defined List in CLD spec has not changed!
+drop table if exists #REF_Service_Type_Delivery_Mech	
+create table #REF_Service_Type_Delivery_Mech
+(Service_Type varchar(200)
+,Sort_Order int
+,Hierarchy int)
+
+insert into #REF_Service_Type_Delivery_Mech
+(Service_Type
+,Sort_Order
+,Hierarchy
+)
+values
+('Long Term Support: Nursing Care', 1, 1)
+,('Long Term Support: Residential Care',  2, 2)
+,('Long Term Support: Community',  3, 3)
+,('Long Term Support: Prison', 4, 4)
+,('Short Term Support: Ongoing Low Level', 5, 5)
+,('Short Term Support: Other Short Term', 6, 6)
+;
+
+
+---------------------------------------------------------------------------------------------------------------------
+/*CREATE REFERENCE TABLE #REF_ST_MAX_SEQUEL_MAPPINGS TO MAP THE FINAL CLD ST-MAX SEQUELS INTO THE STS002 CATEGORIES*/
+---------------------------------------------------------------------------------------------------------------------
+--NOTE: Check periodically to ensure the Defined List in CLD spec has not changed!
+drop table if exists #REF_ST_MAX_Sequel_Mappings
+create table #REF_ST_MAX_Sequel_Mappings
+(ST_Max_Outcome varchar(200)
+,SALT_Mapping varchar(200)
+,Sort_Order int)
+
+insert into #REF_ST_MAX_Sequel_Mappings
+(ST_Max_Outcome
+,SALT_Mapping
+,Sort_Order
+)
+values
+('NFA - 100% NHS funded care', 'Early cessation of service (not leading to long term support) - 100% NHS funded care/End of Life/deceased', 1)
+,('NFA - Deceased', 'Early cessation of service (not leading to long term support) - 100% NHS funded care/End of Life/deceased', 1)
+,('NFA - Self-funded client (Inc. 12wk disregard)', 'No services provided – needs identified but self-funding', 3)
+,('NFA - Support declined', 'No services provided – needs identified but support declined', 6)
+,('NFA - Information & Advice / Signposting only', 'No Services Provided – Universal Services / signposted to other services', 7)
+,('NFA - Moved to another LA', 'No services provided – other', 8)
+,('NFA- Other', 'No services provided – other', 8)
+,('NFA - No services offered: Other reason', 'No services provided – other', 8)
+,('NFA - Support ended: Other reason', 'No services provided – other', 8)
+,('Progress to End of Life Care', 'No services provided – other', 8)
+,('Admitted to hospital', 'No services provided – other', 8)
+,('Long Term Support: Nursing Care', 'Long Term Support (any setting)', 2)
+,('Long Term Support: Residential Care', 'Long Term Support (any setting)', 2)
+,('Long Term Support: Community', 'Long Term Support (any setting)', 2)
+,('Long Term Support: Prison', 'Long Term Support (any setting)', 2)
+,('Short Term Support: Ongoing Low Level', 'Ongoing Low Level Support', 4)
+,('Short Term Support: Other Short Term', 'Short Term Support (other)', 5)
+,('No Service Found', 'No Service Found', 9)
+;
+
+
+
+------------------------------------------------------------------------------------------------------------------------
+/*CREATE REFERENCE TABLE #REF_EVENT_OUTCOME_HIERARCHY TO DE-DUPLICATE WHERE MULTIPLE CONFLICTING EVENT OUTCOMES APPEAR*/
+------------------------------------------------------------------------------------------------------------------------
+--NOTE: Check periodically to ensure the Defined List in CLD spec has not changed!
+drop table if exists #REF_Event_Outcome_Hierarchy
+create table #REF_Event_Outcome_Hierarchy
+(Event_Outcome varchar(200)
+,Event_Outcome_Hierarchy int)
+
+insert into #REF_Event_Outcome_Hierarchy
+(Event_Outcome
+,Event_Outcome_Hierarchy
+)
+values
+('Progress to Reablement/ST-Max', 1)
+,('Progress to Assessment', 2)
+,('Admitted to Hospital', 3)
+,('Progress to Re-assessment / Unplanned Review', 4)
+,('Progress to Support Planning / Services', 5)
+,('Progress to End of Life Care', 6)
+,('No change in package', 7)
+,('Service ended as planned', 8)
+,('Progress to financial assessment', 9)
+,('Provision of service', 10)
+,('NFA - Deceased', 11)
+,('NFA - Moved to another LA', 12)
+,('NFA - 100% NHS-funded care', 13)
+,('NFA - Information & Advice / Signposting only', 14)
+,('NFA - Self-funded client (inc. 12wk disregard)', 15)
+,('NFA - Support declined', 16)
+,('NFA - Support ended – other reason', 17)
+,('NFA - No services offered - other reason', 18)
+,('NFA- Other', 19)
+;
+
+
+---------------------------------------------------------------------------
+/*FILTER DATA APPROPRIATELY FOR INDIVIDUALS AND SELECT PERIOD OF INTEREST*/
+---------------------------------------------------------------------------
+drop table if exists #SUBSET_BUILD
+select *
+into #SUBSET_BUILD
+from [DHSC_ASC].[CLD_R1_Raw]
+where Event_Start_Date <= '2023-12-31' -- Enter period of interest End Date here
+/*no Event End Date filter yet to allow Event clusters to build correctly later in process*/
+and Client_Type = 'Service User'
+and Event_Type in 
+(
+'Request',
+'Assessment',
+'Service',
+'Review'
+)
+;
+
+
+
+-----------------------------------------
+/*CREATE AMALGAMATED NHS/LA IDENTIFIER*/
+-----------------------------------------
+
+--Process used to create unique person ID, taking the NHS Number wherever possible and then deferring to the LA ID to back-fill NHS Number gaps wherever possible
+
+--initially, find all individuals with an NHS Number and stage into a temporary table                              
+drop table if exists #uniquenhs
+SELECT DISTINCT Der_Unique_Record_ID, Der_NHS_Number_Traced_Pseudo, Der_LA_Person_Unique_Identifier_Pseudo, 'NHS' as [Source]                                                                                                                                                     
+INTO #uniquenhs                                                                                                                                                           
+FROM #SUBSET_BUILD                                                                                                                                          
+where Der_NHS_Number_Traced_Pseudo is not NULL                                                                                          
+;
+
+
+--where the NHS Number is missing, pull through all individuals LA Unique ID
+--except in those cases where the LA Unique ID is already present and associated with an individual in #uniquenhs
+drop table if exists #missingnhs
+SELECT distinct a.Der_Unique_Record_ID, a.Der_NHS_Number_Traced_Pseudo, a.Der_LA_Person_Unique_Identifier_Pseudo, 'LA' as [Source]                                                                             
+INTO #missingnhs                                                                                                                                                           
+FROM #SUBSET_BUILD a                                                                                                                                                
+left join #uniquenhs b on a.Der_LA_Person_Unique_Identifier_Pseudo = b.Der_LA_Person_Unique_Identifier_Pseudo                                                                                                          
+where a.Der_NHS_Number_Traced_Pseudo is NULL                                                                                              
+and b.Der_LA_Person_Unique_Identifier_Pseudo is NULL                                                                                     
+;
+
+
+--Stack the NHS IDs and the LA IDs from the two temp tables underneath each other in a final table, as an amalgamated 'ID' field
+drop table if exists #FINAL
+select distinct Der_Unique_Record_ID, Der_NHS_Number_Traced_Pseudo as [ID], [Source]                                     
+into #FINAL                                                                                                                                                                     
+from #uniquenhs                                                                                                                                                           
+UNION                                                                                                                                                               
+select distinct Der_Unique_Record_ID, Der_LA_Person_Unique_Identifier_Pseudo as [ID], [Source]                        
+from #missingnhs
+;
+
+
+--Add a column to Raw table with the new ID field
+alter table #SUBSET_BUILD add [ID] nvarchar (200)
+GO
+;
+update a
+set a.[ID] = b.[ID]
+from #SUBSET_BUILD a left join #FINAL b on a.Der_Unique_Record_ID = b.Der_Unique_Record_ID
+;
+
+
+--delete rows from table where [ID] is NULL
+--These records can not be assigned to an individual with 100% accuracy and without the risk of double-counting 
+--as the NHS ID is NULL and the LA ID is already present in the data associated to an NHS Number
+delete from #SUBSET_BUILD
+where [ID] is NULL
+;
+
+--------------------------------------------------------------------------------------------------------------------------
+
+
+--------------------------------------------------------------
+/*SELECT LATEST VERSION OF EACH EVENT USING BESPOKE EVENT ID*/
+--------------------------------------------------------------
+
+/*Use Concat of fields to create unique Event IDs for all Requests, in-line with how unique events are pin-pointed in 
+the DHSC CLD Dashboard and Principles Document. This ensures the latest edition of each Event is being used (i.e. latest submitted version)
+The CLD spec item Event Reference Number (ERN) has been used previously to distinguish unique events for this but local differences of how the 
+ERN is applied in CLD have meant that it is not always robust enough to use a a unique event identifier*/
+
+
+--Add column to all Service events containing CONCAT of fields as a bespoke unique Event ID
+--NOTE: Event_End_Date is ommitted from CONCAT as we want to try to pin-point old events with NULL end dates as part of this process
+drop table if exists #SERVICES_WITH_CONC
+select *
+, concat(LA_CODE, [ID], CLIENT_TYPE, EVENT_START_DATE, Service_Type, Service_Component, Delivery_Mechanism) as [SERVICE_CONC]
+into #SERVICES_WITH_CONC
+from #SUBSET_BUILD
+where Event_Type = 'Service'
+;
+
+
+
+drop table if exists #SERVICES_LATEST
+select *
+into #SERVICES_LATEST
+from 
+(
+select *
+, DENSE_RANK() OVER (PARTITION by [SERVICE_CONC] order by ImportDate desc) as RN
+from #SERVICES_WITH_CONC
+where ImportDate <= '2024-02-01' --After period of interest submission window closed
+) a
+where RN = 1
+;
+
+
+--Combine all the latest editions of Service Events back in with the rest of the non-Service event rows
+drop table if exists #SUBSET
+select *
+into #SUBSET
+from
+(
+select *
+from #SERVICES_LATEST
+union
+select *, 'NA' as [SERVICE_CONC], '0' as [Rn]
+from #SUBSET_BUILD
+where Event_Type not like 'Service'
+) a
+;
+
+
+------------------------------------------------------------------------------------------------------------------
+
+------------------------
+/*PRODUCE ST-MAX TABLE*/
+------------------------
+
+
+------------------------------------------------------------------------------------------
+/*ST-MAX EVENTS RESULTING FROM A REQUEST FOR SUPPORT IN STS001 WHERE SEQUEL WAS 'ST-MAX'*/
+------------------------------------------------------------------------------------------
+
+/*ST_MAX event rows in #SUBSET that were present in STS001 where sequel to request was 'ST-MAX' (table 'SALT_STS002a_Cohort')
+
+These ST-Max records will be clustered together where appropriate, to avoid double-counting, using thresholds agreed with CLD SALT Working Group
+
+No maximum End Date is added yet and any NULL Event End Dates (i.e Open/ongoing ST-Max events) 
+are CASED here with todays date to ensure that the full cluster/chain of ST-MAX events is formed correctly
+No minimum End Date either to ensure that Events that are before the time period can still be used, if they form part of a chain
+of Events that latterly fall within the time period*/
+
+DECLARE
+  @StartDate DATE,
+  @EndDate   DATE
+
+SET @StartDate = '2023-04-01'  -- Complete as required
+SET @EndDate = '2023-12-31'    -- Complete as required
+
+
+drop table if exists #ST_MAX_BUILD
+select a.LA_CODE, a.[ID], a.Event_Start_Date
+, CASE WHEN a.Event_End_Date is NULL then CAST( GETDATE() AS Date) else a.Event_End_Date End as Event_End_Date
+, a.Event_Outcome
+into #ST_MAX_BUILD
+from #SUBSET a
+inner join [ASC_Sandbox].[SALT_STS002a_Cohort] b on a.LA_CODE = b.LA_CODE and a.[ID] = b.[ID] and a.Event_Start_Date = b.Sequel_Event_Start_Date
+where a.Event_Type = 'Service'
+and a.Service_Type = 'Short Term Support: ST-Max'
+and (Date_of_Death >= @StartDate OR Date_of_Death is NULL) -- This filter removes Clients who have a recorded date of death at this stage
+group by a.LA_CODE, a.[ID], a.Event_Start_Date, a.Event_End_Date, a.Event_Outcome
+;
+
+
+
+-------------------------------------------------------------------------
+/*INCORPORATE 'ISLANDS AND GAPS' LOGIC INTO A BUILD OF THE ST-MAX TABLE*/
+-------------------------------------------------------------------------
+/*This piece of code looks at all of the ST-Max events recorded against a Client to try and determine whether any Events need to be clustered together
+and be counted as one distinct Reablement period.
+
+By ordering the ST-Max data chronologically earliest to latest for each Client (by LA), it is then possible to query the time elapsed between the End Date
+of one Event and the Start Date of another Event - for those Clients that have more than one in the period of interest.
+
+Code allows for breaks of 1 day, between one ST-Max event record ending and a subsequent one starting (see 'DATEADD' syntax). This threshold was agreed 
+in collaboration with analytical colleagues on the LA working group. Any 'Gap' longer than a day is considered a break and any activity after this
+point constitutes a new 'Island' or ST-Max Cluster
+*/
+drop table if exists #ST_MAX_With_Count
+SELECT distinct a.*, Islands.IslandID as [ST_MAX_COUNT]
+, MIN(a.Event_Start_Date) OVER (PARTITION BY a.LA_CODE, a.[ID], Islands.IslandID) as [MIN_START_DATE]
+into #ST_MAX_With_Count
+FROM #ST_MAX_BUILD a
+inner join
+    (
+    SELECT
+        *,
+        CASE WHEN Groups.PreviousEndDate >= DATEADD(DAY, -1, Event_Start_Date) THEN 0 ELSE 1 END AS IslandStartInd,
+        SUM(CASE WHEN Groups.PreviousEndDate >= DATEADD(DAY, -1, Event_Start_Date) THEN 0 ELSE 1 END) OVER (partition by LA_CODE, [ID] ORDER BY Groups.[ID], Groups.DRN) AS IslandId
+    FROM
+    (
+        SELECT
+			DENSE_RANK() OVER (partition by LA_CODE, [ID] ORDER BY Event_Start_Date, Event_End_Date) AS DRN,
+			LA_CODE,
+			[ID],
+            Event_Start_Date,
+            Event_End_Date,
+            LAG(Event_End_Date,1) OVER (partition by LA_CODE, [ID] ORDER BY Event_Start_Date,Event_End_Date) AS PreviousEndDate
+        FROM
+            #ST_MAX_BUILD
+    ) Groups
+) Islands
+on a.[ID] = Islands.[ID] and a.Event_Start_Date = Islands.Event_Start_Date and a.Event_End_Date = Islands.Event_End_Date
+order by a.LA_CODE, a.[ID], a.Event_Start_Date, Islands.IslandID
+;
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+
+/*Find the latest Event End Date associated with each newly-clustered ST-MAX record and pull only this through, as 'Cluster End Date'
+The Event Outcome of the latest event in each cluster will be will be referred back to in cases where no sequel to the reablement can be found in the onward chronology
+So we now have ST-Max Clusters with Start and End dates potentially taken from different ST-Max event rows*/
+drop table if exists #ST_MAX_Latest_End
+select distinct LA_CODE, [ID], MIN_START_DATE as [Cluster_Start_Date], Event_End_Date as [Cluster_End_Date], Event_Outcome, ST_MAX_COUNT
+into #ST_MAX_Latest_End
+from 
+(
+select *,
+DENSE_RANK() OVER (partition by LA_CODE, [ID], ST_MAX_COUNT ORDER BY Event_End_Date DESC) AS RN -- DESCENDING so RN '1' is always the option to filter for
+from #ST_MAX_with_Count
+) a
+where RN = 1
+order by LA_CODE, [ID], MIN_START_DATE, ST_MAX_COUNT
+;
+
+
+
+/*Now ST-Max chains/clusters have been fully formed, we can now select only those clusters that end within the time period
+Any NULL End Dates (i.e. Open event clusters) have been CASED with todays date in earlier #ST_MAX_BUILD table to enable their removal at this point*/
+drop table if exists #ST_MAX;
+select *
+into #ST_MAX
+from #ST_MAX_Latest_End
+where Cluster_End_Date between '2023-04-01' and '2023-12-31'
+;
+
+
+
+--------------------------------------------------------------------
+-- 2.1 SEARCH THE CHRONOLOGY OF ALL ST-MAX EVENTS
+--------------------------------------------------------------------
+
+/* ST-MAX clusters will now be staged into final #STS002a Table along with their correct Sequel (where known)
+As they are staged they will be recorded with a 'Record Type' to track/record how each ST-Max cluster has been categorised
+
+KEY:
+1 = No Further Chronology (at all). Sequel derived from Event Outcome of ST-Max cluster, mapped to SALT where possible
+2 = All ST-Max with a ‘Service’ sequel (ranked by Hierarchy)
+3 = No sequel ‘Service’ found, but an ‘NFA’ outcome encountered in the chronology (e.g. outcome of an Assessment). Map these NFA to SALT categories
+4 = No NFA outcomes observed (as per ‘3’ above) in the sequel chronology, defer back to the Event Outcome of the ST-Max cluster, mapped to SALT where possible
+5 = Out Of Scope. Onward chronology was found, but was either a) too long after the ST-Max event ended or b) another ST-Max was encountered in the chronology, superseding this cluster
+
+*/
+
+
+
+---------------------------------------------------------------------------------------------------------
+/*STEP 1: APPLY EVENT OUTCOME HIERARCHY TO ANY ST-MAX CLUSTERS WITH MULTIPLE CONFLICTING EVENT OUTCOMES*/
+---------------------------------------------------------------------------------------------------------
+
+/* this can occur in the data where ST-Max event rows for the same Clients have identical End Dates but different
+Event Outcomes. In most cases, the 'Select Latest version of each event using bespoke Event ID' process earlier on
+will correct these but in certain scenarios Events won't be captured by that process*/
+
+--Join in the Event Hierarcy reference data
+drop table if exists #EVENT_OUTCOME_HIERARCHY
+select a.*
+, CASE WHEN b.Event_Outcome_Hierarchy is NULL then 99
+else b.Event_Outcome_Hierarchy END as 'Event_Outcome_Hierarchy'
+into #EVENT_OUTCOME_HIERARCHY
+from #ST_MAX a
+left join #REF_Event_Outcome_Hierarchy b on a.Event_Outcome = b.Event_Outcome
+;
+
+--Select the lowest Event Outcome hierarchy for each ST-Max cluster
+drop table if exists #ST_MAX_NEW_CLIENTS_DeDupe
+select a.*
+into #ST_MAX_NEW_CLIENTS_DeDupe
+from #EVENT_OUTCOME_HIERARCHY a
+inner join
+(
+select *
+, DENSE_RANK() OVER (partition by LA_CODE, [ID], ST_MAX_COUNT ORDER BY Event_Outcome_Hierarchy ASC) AS RN
+from #EVENT_OUTCOME_HIERARCHY
+) b
+on a.LA_CODE = b.LA_CODE and a.[ID] = b.[ID] and a.ST_MAX_COUNT = b.ST_MAX_COUNT and a.Event_Outcome_Hierarchy = B.Event_Outcome_Hierarchy
+where b.RN = 1
+;
+
+
+-------------------------------------------------------------------------
+/*STEP 2: JOIN ST-MAX EVENTS TO THE ONWARD CHRONOLOGY FOR THOSE CLIENTS*/
+-------------------------------------------------------------------------
+
+/*Join all the relevent Client ST-MAX clusters to all subsequent activity for that Client in the CLD chronology*/
+drop table if exists #ST_MAX_SEQUELS
+select a.*
+,b.LA_CODE as 'Sequel_LA_Code', b.[ID] as 'Sequel_ID', b.Event_Start_Date as 'Sequel_Event_Start_Date', 
+b.Event_End_Date as 'Sequel_Event_End_Date', b.Event_Type as 'Sequel_Event_Type', b.Service_Type as 'Sequel_Service_Type', b.Service_Component as 'Sequel_Service_Component'
+,b.Event_Outcome as 'Sequel_Event_Outcome'
+,DENSE_RANK() over (Partition by a.LA_CODE, a.[ID], a.ST_MAX_COUNT order by b.Event_Start_Date) as Rn
+into #ST_MAX_SEQUELS
+from #ST_MAX_NEW_CLIENTS_DeDupe a
+left join #SUBSET b on a.LA_CODE = b.LA_CODE and a.[ID] = b.[ID]
+where b.Event_Start_Date >= a.Cluster_End_Date
+order by a.LA_CODE, a.[ID], a.Cluster_Start_Date, b.Event_Start_Date
+;
+
+
+/*Remove any instances of the same ST_Max itself appearing again in its own sequel chronology
+this will sometimes happen due to the clustering of dates (onwards events will sometimes start on same day as cluster end date)*/
+delete from #ST_MAX_SEQUELS
+where Sequel_Service_Type = 'Short Term Support: ST-Max' and Cluster_Start_Date = Sequel_Event_Start_Date
+or Sequel_Service_Type = 'Short Term Support: ST-Max' and Cluster_End_Date = Sequel_Event_End_Date
+;
+
+
+
+
+---------------------------------------------------------------
+/*STEP 3: FIND THOSE ST-MAX EVENTS WITH NO FURTHER CHRONOLOGY*/
+---------------------------------------------------------------
+
+/*Some ST-MAX events have no further records in CLD, and therefore none in #ST_MAX_SEQUELS table
+These are staged here and then added to the final STS002a table, labelled as having no further records in chronology
+If these aren't moved into the final table a significant number of ST-MAX events are lost*/
+drop table if exists #NO_SEQUEL_CHRONOLOGY
+select distinct a.LA_CODE, a.[ID], a.Cluster_Start_Date, a.Cluster_End_Date, a.ST_MAX_COUNT, a.Event_Outcome
+into #NO_SEQUEL_CHRONOLOGY
+from #ST_MAX_NEW_CLIENTS_DeDupe a
+left join #ST_MAX_SEQUELS b
+on a.LA_CODE = b.LA_CODE and a.[ID] = b.[ID] and  a.Cluster_Start_Date = b.Cluster_Start_Date and  
+a.Cluster_End_Date = b.Cluster_End_Date and a.Event_Outcome = b.Event_Outcome and a.ST_MAX_COUNT = b.ST_MAX_COUNT
+where b.LA_CODE is NULL
+;
+
+
+--Remove these No Sequel chronology events from the #ST_MAX_SEQUELS table
+delete a
+from #ST_MAX_NEW_CLIENTS_DeDupe  a
+left join #ST_MAX_SEQUELS b
+on a.LA_CODE = b.LA_CODE and a.[ID] = b.[ID] and  a.Cluster_Start_Date = b.Cluster_Start_Date and  
+a.Cluster_End_Date = b.Cluster_End_Date and a.Event_Outcome = b.Event_Outcome and a.ST_MAX_COUNT = b.ST_MAX_COUNT
+where b.LA_CODE is NULL
+;
+
+
+/*Insert the No Chronology records into #STS002a with bespoke FINAL_OUTCOME so they can be identified
+Where the events with no further chronology have an Event Outcome of 'Service Ended As Planned' these
+can be classified as 'No Services Provided - Other' in FINAL_OUTCOME_MAPPED, keeping the 'No Chronology_'
+version in FINAL_OUTCOME column for means of differentiating these records from other 'No Services Provided' records*/
+
+--Firstly insert where Event Outcome CAN be mapped to SALT (i.e. valid Event Outcome)
+--Use prefix 'No_Chronology' plus Event Outcome of ST-Max cluster to create FINAL_OUTCOME column
+--Use prefix 'No_Chronology' plus Event Outcome mapped to #REF_ST_MAX_Sequel_Mappings to create FINAL_OUTCOME_MAPPED column
+drop table if exists #STS002a
+select a.LA_CODE, a.[ID]
+, 'No_Chronology_'+Event_Outcome as 'FINAL_OUTCOME'
+, CASE WHEN Event_Outcome = 'Service Ended As Planned' THEN 'No services provided – other'
+  ELSE 'No_Chronology_'+b.SALT_Mapping END as 'FINAL_OUTCOME_MAPPED'
+, '1' as 'Record_Type'
+into #STS002a
+from #NO_SEQUEL_CHRONOLOGY a
+left join #REF_ST_MAX_Sequel_Mappings b on a.Event_Outcome = b.ST_Max_Outcome
+where b.SALT_Mapping is not NULL
+;
+
+--Secondly insert where Event Outcome CAN NOT be mapped to SALT (Unable To Classify)
+insert Into #STS002a
+select a.LA_CODE, a.[ID]
+, 'No_Chronology_'+Event_Outcome as 'FINAL_OUTCOME'
+, CASE WHEN Event_Outcome = 'Service Ended As Planned' THEN 'No services provided – other'
+  ELSE 'No_Chronology_Unable_To_Classify' END as 'FINAL_OUTCOME_MAPPED'
+, '1' as 'Record_Type'
+from #NO_SEQUEL_CHRONOLOGY a
+left join #REF_ST_MAX_Sequel_Mappings b on a.Event_Outcome = b.ST_Max_Outcome
+where b.SALT_Mapping is NULL
+;
+
+
+---------------------------------------------------------------------------------------
+/*STEP 4: FIND THE CORRECT SEQUEL TO THE ST-MAX EVENTS THAT DO HAVE ONWARD CHRONOLOGY*/
+---------------------------------------------------------------------------------------
+
+-------------------------
+/*Clustering of Sequels*/
+-------------------------
+/*This code creates a process called 'Create Cluster' where Sequel Events that begin less than 4 days after the previous Sequel Event ending are flagged '1' (to include)
+
+The 'In_Scope' field created flags whether or not the onward chronology following the ST-Max is considered to be related to the Reablement in question.
+If first event after the ST-Max ended is >3 days after, this chronology is not in scope as too much time has elapsed.
+
+The 'In_Chain' field created flags whether or not a sequel event is still part of an unbroken chain/sequence of events following the ST-Max (>3 day gap between
+one Event ending and another starting breaks the chain/cluster and everything after this point is considered unrelated to the original Reablement event)*/
+drop table IF EXISTS #CLUSTER;
+with Create_Cluster as
+(
+  SELECT *,
+    CASE WHEN 
+     DATEDIFF(
+       DAY, 
+       LAG(Sequel_Event_End_Date) OVER (PARTITION BY LA_Code, [ID], ST_MAX_Count ORDER BY Sequel_Event_Start_Date) , 
+       Sequel_Event_Start_Date
+     ) > 3 THEN 0   
+	 ELSE 1 END AS Flag -- Build chain/cluster of sequel events, with gap of no more than 3 days between
+  FROM #ST_MAX_SEQUELS
+)
+(select *,
+MIN(In_Chain) OVER (PARTITION BY LA_CODE, [ID], ST_MAX_Count ORDER BY Sequel_Event_Start_Date) as In_Scope -- Use the [In_Chain] flag built below to determine if the ST-Max has any sequel chronology in scope for analysis 
+into #CLUSTER
+from
+(
+SELECT *,
+CASE 
+WHEN Sequel_Event_End_Date is NULL and Rn = 1 then 1 --mitigates issue with Open events tripping up the logic 
+WHEN DATEDIFF (DAY, Cluster_End_Date, Sequel_Event_Start_Date) > 3 and Rn = 1 then 0 -- if the first Event in chronology is more than 3 days after ST-Max then no chronology is in scope
+ELSE MIN(flag) OVER (PARTITION BY LA_CODE, [ID], ST_MAX_Count ORDER BY Sequel_Event_Start_Date) END as In_Chain
+FROM Create_Cluster
+) x
+)
+ORDER BY [ID], ST_MAX_Count
+;
+
+
+/*Addition of a flag that signifies a 'break' in the series when another ST-MAX record is encountered in the chronology (Cluster_No_STMax flag)
+
+A more recent ST-Max cluster should supplant and supersede the existing one, so the chronology search is stopped at this stage if Cluster_No_Request flag does not = 1
+The superseded ST-Max cluster gets staged into #STS001 at the end of the process
+
+This table build also pulls through the 'Hierarchy' column from REF data to allow for subsequent selection of the highest ranking Service (lowest Hierarchy number)
+using a join to the #REF_Service_Type_Delivery_Mech table where more than one Service appears in an ST-Max cluster. Records that have not joined to the Service Reference Table 
+(e.g. Assessments, Requests) have been CASED as '99' to ensure they are always out-ranked by a Service Event*/
+drop table IF EXISTS #ST_MAX_WITH_BREAKS;
+select b.*
+, CASE WHEN c.Hierarchy is NULL then 99 else c.Hierarchy end as [Service_Hierarchy]
+into #ST_MAX_WITH_BREAKS
+from
+(
+select *,
+MIN([ST_MAX_Break]) OVER (PARTITION BY LA_CODE, [ID], ST_MAX_Count ORDER BY Sequel_Event_Start_Date) AS [Cluster_No_STMax] -- If sequel cluster contains another ST-Max this breaks the chain
+from
+(
+select *,
+CASE
+when Sequel_Service_Type like 'Short Term Support: ST-Max' then 0 else 1 end as [ST_MAX_Break]
+from #CLUSTER
+) a
+) b
+left join #REF_Service_Type_Delivery_Mech c on b.Sequel_Service_Type = c.Service_Type
+where b.In_Scope = 1 and b.Cluster_No_StMax = 1
+;
+
+
+
+----------------------
+/*Service Chronology*/
+----------------------
+/*Choose the lowest Hierarchy (i.e. highest ranking Service) against each ST-Max cluster in cases where at least one Service Event was found in the chronology 
+(Cluster_Outcome not '99'). These can then be added into #STS002a*/
+drop table IF EXISTS #FIND_NEXT_SERVICES
+select distinct a.LA_CODE, a.[ID], a.Cluster_Start_Date, a.Cluster_End_Date, a.Event_Outcome,  a.ST_MAX_COUNT, a.Sequel_Service_Type as 'FINAL_OUTCOME'
+into #FIND_NEXT_SERVICES
+from #ST_MAX_WITH_BREAKS a
+inner join
+(
+select LA_CODE, [ID], ST_MAX_Count, MIN([Service_Hierarchy]) as [Cluster_Outcome]
+from #ST_MAX_WITH_BREAKS
+group by LA_CODE, [ID], ST_MAX_Count
+) b
+on a.LA_Code = b.LA_CODE and a.[ID] = b.[ID] and a.ST_MAX_COUNT = b.ST_MAX_COUNT and a.Service_Hierarchy = b.Cluster_Outcome
+where Cluster_Outcome != 99
+;
+
+
+--Insert into Final table, showing the Sequel Service Type (FINAL_OUTCOME) and Sequel Service Type mapped to SALT outcomes (FINAL_OUTCOME_MAPPED)
+insert into #STS002a
+select a.LA_CODE, a.[ID]
+, a.FINAL_OUTCOME
+, b.SALT_MAPPING as 'FINAL_OUTCOME_MAPPED'
+,'2' as 'Record_Type'
+from #FIND_NEXT_SERVICES a
+left join #REF_ST_MAX_Sequel_Mappings b on a.FINAL_OUTCOME = b.ST_Max_Outcome
+;
+
+
+
+
+--------------------------
+/*NON-SERVICE CHRONOLOGY*/
+--------------------------
+/*Extract all the ST-Max Sequels where no Service Event is present in the Sequel chronology (Cluster_Outcome = 99)
+This is either because the Client has no onward Services in their onward Event activity, or the Service(s) they do have are not part of
+the sequel chain of Events following the Reablement period ending (see Islands and Gaps script above for further info on the date thresholds)
+
+
+The Assessment/Review events associated with these 'No Service Found' type of sequels can still be analysed to see if any further information
+can be gleaned from their Event Outcomes before staging into the final table (i.e do they have any 'NFA' type Event Outcomes recorded?)
+which may give us more useful information than simply defaulting back to the Event Outcome of the initial ST-Max event*/
+drop table IF EXISTS #FIND_NEXT_OTHER
+select distinct a.LA_CODE, a.[ID], a.Cluster_Start_Date, a.Cluster_End_Date, a.Event_Outcome,  a.ST_MAX_COUNT
+, a.Sequel_Event_Type
+, a.Sequel_Event_Start_Date
+, a.Sequel_Event_End_Date
+, a.Sequel_Event_Outcome --this needs adding now as we need to evaluate the outcome of these Assess/Request rows but it may introduce duplicates
+, DENSE_RANK() over (Partition by a.LA_CODE, a.[ID], a.ST_MAX_COUNT order by a.Sequel_Event_End_Date desc) as Rn
+into #FIND_NEXT_OTHER
+from #ST_MAX_WITH_BREAKS a
+inner join
+(
+select LA_CODE, [ID], ST_MAX_Count, MIN([Service_Hierarchy]) as [Cluster_Outcome]
+from #ST_MAX_WITH_BREAKS
+group by LA_CODE, [ID], ST_MAX_Count
+) b
+on a.LA_Code = b.LA_CODE and a.[ID] = b.[ID] and a.ST_MAX_COUNT = b.ST_MAX_COUNT and a.Service_Hierarchy = b.Cluster_Outcome
+where Cluster_Outcome = 99
+;
+
+
+/*In these clusters where no Service Event is present, extract any clusters with No Further Action outcomes in the sequel activity
+(choosing the latest End Date where numerous NFA outcomes are returned). This enables the Sequel to be designated an NFA outcome as per SALT, 
+rather than the default 'No Service Found'*/
+drop table IF EXISTS #FIND_NEXT_OTHER_NFA
+select a.LA_CODE, a.[ID], a.Cluster_Start_Date, a.Cluster_End_Date, a.ST_MAX_COUNT, a.Sequel_Event_Outcome
+, count(a.[ID]) OVER (Partition by a.LA_CODE, a.[ID], a.ST_MAX_COUNT) as [NFA_Count]
+into #FIND_NEXT_OTHER_NFA
+from #FIND_NEXT_OTHER a
+inner join 
+(
+select LA_CODE, [ID], ST_MAX_Count, MIN([Rn]) as [Cluster_Outcome]
+from #FIND_NEXT_OTHER
+where Sequel_Event_Outcome like 'NFA%'
+group by LA_CODE, [ID], ST_MAX_Count
+) b 
+on a.LA_CODE = b.[LA_CODE] and a.[ID] = b.[ID] and a.ST_MAX_COUNT = b.ST_MAX_COUNT and a.Rn = b.Cluster_Outcome
+where Sequel_Event_Outcome like 'NFA%'
+;
+
+
+/*Stage these NFA outcomes into the final #STS002a table
+NOTE: when there are conflicting types of NFA for the same ST-Max Event, this is over-written as 'NFA- Other'
+which maps to 'No service provided - other' in the SALT mapping*/
+insert into #STS002a
+select distinct a.LA_CODE, a.[ID]
+, CASE WHEN NFA_Count = 1 THEN a.Sequel_Event_Outcome
+  ELSE 'NFA- Other' 
+  END as 'FINAL_OUTCOME'
+, CASE WHEN NFA_Count = 1 THEN b.SALT_Mapping
+  ELSE 'No services provided – other'
+  END as 'FINAL_OUTCOME_MAPPED'
+,'3' as 'Record_Type'
+from #FIND_NEXT_OTHER_NFA a
+left join #REF_ST_MAX_Sequel_Mappings b on a.Sequel_Event_Outcome = b.ST_Max_Outcome
+;
+
+
+
+/*In these #FIND_NEXT_OTHER clusters where no Service Event is present, extract any remaining outcomes where no further information can be gleaned
+from the Event Outcome of the sequel events i.e. the Event Outcomes on any of the Assessments/Review rows were not useable for the purposes of 
+STS002 categorisation. These will default back to the Event Outcome of the original Request for the sequel derivation, in lieu of nothing more 
+definitive being possible to ascertain from the chronology*/
+drop table IF EXISTS #FIND_NEXT_OTHER_No_Outcome
+select distinct a.LA_CODE, a.[ID], a.ST_MAX_COUNT, a.Event_Outcome
+into #FIND_NEXT_OTHER_No_Outcome
+from #FIND_NEXT_OTHER a
+left join #FIND_NEXT_OTHER_NFA b
+on a.LA_CODE = b.LA_CODE and a.[ID] = b.[ID] and a.ST_MAX_COUNT = b.ST_MAX_COUNT
+where b.LA_CODE is NULL
+;
+
+
+
+/*insert into final STS002a table, with the prefix 'No Service Found' followed by the original Event Outcome to create FINAL_OUTCOME
+column and prefix 'No Service Found' plus Event Outcome, mapped to #REF_SEQUEL_MAPPING, to create FINAL_OUTCOME_MAPPED*/
+insert into #STS002a
+select a.LA_CODE, a.[ID]
+, 'No Service Found_'+a.Event_Outcome as 'FINAL_OUTCOME'
+, CASE WHEN a.Event_Outcome like 'NFA%' THEN b.SALT_Mapping
+  WHEN a.Event_Outcome = 'Service Ended as Planned' THEN 'No services provided - other'
+  ELSE 'No Service Found'
+  END as 'FINAL_OUTCOME_MAPPED'
+, '4' as 'Record_Type'
+from #FIND_NEXT_OTHER_No_Outcome a
+left join #REF_ST_MAX_Sequel_Mappings b on a.Event_Outcome = b.ST_Max_Outcome
+;
+
+
+---------------------------
+/*CHRONOLOGY NOT IN-SCOPE*/
+---------------------------
+/*Extract the remaining St-Max events that were IN the #CLUSTER table but not the #ST_MAX_WITH_BREAKS table
+These are effectively any St-Max clusters that contain some onward event activity, but this activity is out of scope for consideration, either:
+a) Flagged '0' in the [In_Scope] flag i.e. the first Event that appears in the Clients event chronology following the end of the ST-Max
+   was too long after the Reablement ended to be considered related/connected
+b) Flagged '0' in the [Cluster_No_Request] flag i.e. another separate ST-Max Event was encountered in the chronology chain before any sequel was found, 
+superceding the initial event
+
+These Request events still need staging into the final STS002a table, even though no sequel events could be found, otherwise ST-Max events are left
+unaccounted for and lost in the overall headline Request counts*/
+drop table IF EXISTS #FIND_NEXT_OUT_OF_SCOPE
+select distinct a.LA_CODE, a.[ID], a.Cluster_Start_Date, a.Cluster_End_Date, a.ST_MAX_COUNT, a.Event_Outcome
+into #FIND_NEXT_OUT_OF_SCOPE
+from #CLUSTER a
+left join #ST_MAX_WITH_BREAKS b
+on a.LA_CODE = b.LA_CODE and a.[ID] = b.[ID] and a.Cluster_Start_Date = b.Cluster_Start_Date and a.Cluster_End_Date = b.Cluster_End_Date and a.Event_Outcome = b.Event_Outcome
+where b.LA_CODE is NULL
+;
+
+
+
+/*Firstly insert these into final #STS002a table where SALT mapping CAN be used
+Use prefix 'No_Chronology' plus Event Outcome from ST-Max cluster as the FINAL_OUTCOME
+Use prefix 'No_Chronology' plus Event Outcome, mapped to the #REF_ST_MAX_Sequel_Mappings table, as the FINAL_OUTCOME_MAPPED
+*/
+insert into #STS002a
+select LA_CODE, [ID]
+, 'No_Chronology_'+Event_Outcome as 'FINAL_OUTCOME'
+, CASE WHEN Event_Outcome = 'Service Ended as Planned' then 'No services provided – other'
+  ELSE 'No_Chronology_'+b.SALT_MAPPING END  as 'FINAL_OUTCOME_MAPPED'
+,'5' as 'Record_Type'
+from #FIND_NEXT_OUT_OF_SCOPE a
+left join #REF_ST_MAX_Sequel_Mappings b on a.Event_Outcome = b.ST_Max_Outcome
+where b.SALT_Mapping is not NULL
+;
+
+
+/*Secondly insert into final #STS002a table - where Event Outcomes do not map to SALT
+Use prefix 'No_Chronology' plus Event Outcome from ST-Max cluster as the FINAL_OUTCOME
+Case as 'No_Chronology_Unable_To_Classify' as the FINAL_OUTCOME_MAPPED, unless Event Outcome is 'Service Ended As Planned' which
+can be mapped to 'No Services Provided - other'
+*/
+insert into #STS002a
+select LA_CODE, [ID]
+, 'No_Chronology_'+Event_Outcome as 'FINAL_OUTCOME'
+, CASE WHEN Event_Outcome = 'Service Ended as Planned' then 'No services provided – other'
+  ELSE 'No_Chronology_Unable_To_Classify' END  as 'FINAL_OUTCOME_MAPPED'
+,'5' as 'Record_Type'
+from #FIND_NEXT_OUT_OF_SCOPE a
+left join #REF_ST_MAX_Sequel_Mappings b on a.Event_Outcome = b.ST_Max_Outcome
+where b.SALT_Mapping is NULL
+;
+
+
+/*
+
+Key for Record_Types in final STS002a table:
+
+1 = No Further Chronology (at all). Sequel derived from Event Outcome of ST-Max cluster, mapped to SALT where possible
+2 = All ST-Max with a ‘Service’ sequel (ranked by Hierarchy)
+3 = No sequel ‘Service’ found, but an ‘NFA’ outcome encountered in the chronology (e.g. outcome of an Assessment). Map these NFA to SALT categories
+4 = No NFA outcomes observed (as per ‘3’ above) in the sequel chronology, defer back to the Event Outcome of the ST-Max cluster, mapped to SALT where possible
+5 = Out Of Scope. Onward chronology was found, but was either a) too long after the ST-Max event ended or b) another ST-Max was encountered in the chronology, superseding this cluster
+
+*/
+
+
+---------------------
+/*END OF PROCESSING*/
+---------------------
+
+
+
+
+----------------------------------------------
+/*PRODUCE ASCOF 2A NUMERATOR AND DENOMINATOR*/
+----------------------------------------------
+
+
+---------------
+/*DENOMINATOR*/
+---------------
+drop table IF EXISTS #ASCOF_2A_DENOMINATOR
+select LA_CODE, count(*) as 'ASCOF_2A_DENOMINATOR'
+into #ASCOF_2A_DENOMINATOR
+from #STS002a
+where FINAL_OUTCOME_MAPPED in 
+(
+'Long Term Support (any setting)'
+,'Ongoing Low Level Support'
+,'Short Term Support (other)'
+,'No Services Provided – Universal Services / signposted to other services'
+,'No services provided – other'
+)
+group by LA_CODE
+
+
+---------------
+/*NUMERATOR*/
+---------------
+drop table IF EXISTS #ASCOF_2A_NUMERATOR
+select LA_CODE, count(*) as 'ASCOF_2A_NUMERATOR'
+into #ASCOF_2A_NUMERATOR
+from #STS002a
+where FINAL_OUTCOME_MAPPED in 
+(
+'Ongoing Low Level Support'
+,'Short Term Support (other)'
+,'No Services Provided – Universal Services / signposted to other services'
+,'No services provided – other'
+)
+group by LA_CODE

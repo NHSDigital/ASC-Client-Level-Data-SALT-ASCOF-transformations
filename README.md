@@ -15,10 +15,10 @@
 
 ## How to apply them
 
-#### The codes were developed by NHS England using the access to the AGEM CLD Repository and as such the labels used reflect this (Database names, table names, field names). The principles of the base code should, however, be transferable once these adjustments are made.
+#### The codes were developed by NHS England using the access to the AGEM CLD Repository and as such the labels used reflect this (Database names, table names, field names). The principles of the base code should, however, be transferable once adjustments to these labels are made.
 
 
 ## Known Limitations
 
-#### As a new data collection, with a change in the underlying source, metrics derived from CLD are not expected to perfectly match those from SALT (and a small number of fields in SALT Reproducing SALT and ASCOF metrics from Client Level Data were not carried over to the CLD specification). However, the approach outlined is intended to stay in line with principles adopted by SALT. See the individual Notes and Limitations associated with each measure for more specific information
+#### As a new data collection, with a change in the underlying source, metrics derived from CLD are not expected to perfectly match those from SALT (and a small number of fields collected and used in SALT were not carried over to the CLD specification). However, the approach outlined is intended to stay in line with principles adopted by SALT. See the individual Notes and Limitations associated with each measure for more specific information
 

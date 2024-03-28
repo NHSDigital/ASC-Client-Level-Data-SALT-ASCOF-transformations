@@ -1,0 +1,349 @@
+
+----------------------------------------------
+/*STS002b (HIGH-LEVEL) SALT REPLICATION CODE*/
+----------------------------------------------
+
+
+/*
+PLEASE READ:
+
+This script uses a series of code logic designed to remain as true to the principles of SALT as possible. 
+
+Only high-level totals of ST-Max events for existing Clients are produced by the code. Further development would be needed in order to categorise the 
+outcomes of these reablement periods into the STS002b SALT categories
+
+*/
+
+
+---------------------------------------------------------------------------
+/*FILTER DATA APPROPRIATELY FOR INDIVIDUALS AND SELECT PERIOD OF INTEREST*/
+---------------------------------------------------------------------------
+drop table if exists #SUBSET_BUILD
+select *
+into #SUBSET_BUILD
+from [DHSC_ASC].[CLD_R1_Raw]
+where Event_Start_Date <= '2023-12-31' -- no End Date defined yet to allow Event clusters to build correctly later in process
+and Client_Type = 'Service User'
+and Event_Type in 
+(
+'Request',
+'Assessment',
+'Service',
+'Review'
+)
+;
+
+
+-----------------------------------------
+/*CREATE AMALGAMATED NHS/LA IDENTIFIER*/
+-----------------------------------------
+
+--Process used to create unique person ID, taking the NHS Number wherever possible and then deferring to the LA ID to back-fill NHS Number gaps wherever possible
+
+--initially, find all individuals with an NHS Number and stage into a temporary table                              
+drop table if exists #uniquenhs
+SELECT DISTINCT Der_Unique_Record_ID, Der_NHS_Number_Traced_Pseudo, Der_LA_Person_Unique_Identifier_Pseudo, 'NHS' as [Source]                                                                                                                                                     
+INTO #uniquenhs                                                                                                                                                           
+FROM #SUBSET_BUILD                                                                                                                                          
+where Der_NHS_Number_Traced_Pseudo is not NULL                                                                                          
+;
+
+
+--where the NHS Number is missing, pull through all individuals LA Unique ID
+--except in those cases where the LA Unique ID is already present and associated with an individual in #uniquenhs
+drop table if exists #missingnhs
+SELECT distinct a.Der_Unique_Record_ID, a.Der_NHS_Number_Traced_Pseudo, a.Der_LA_Person_Unique_Identifier_Pseudo, 'LA' as [Source]                                                                             
+INTO #missingnhs                                                                                                                                                           
+FROM #SUBSET_BUILD a                                                                                                                                                
+left join #uniquenhs b on a.Der_LA_Person_Unique_Identifier_Pseudo = b.Der_LA_Person_Unique_Identifier_Pseudo                                                                                                          
+where a.Der_NHS_Number_Traced_Pseudo is NULL                                                                                              
+and b.Der_LA_Person_Unique_Identifier_Pseudo is NULL                                                                                     
+;
+
+
+--Stack the NHS IDs and the LA IDs from the two temp tables underneath each other in a final table, as an amalgamated 'ID' field
+drop table if exists #FINAL
+select distinct Der_Unique_Record_ID, Der_NHS_Number_Traced_Pseudo as [ID], [Source]                                     
+into #FINAL                                                                                                                                                                     
+from #uniquenhs                                                                                                                                                           
+UNION                                                                                                                                                               
+select distinct Der_Unique_Record_ID, Der_LA_Person_Unique_Identifier_Pseudo as [ID], [Source]                        
+from #missingnhs
+;
+
+
+--Add a column to Raw table with the new ID field
+alter table #SUBSET_BUILD add [ID] nvarchar (200)
+GO
+;
+update a
+set a.[ID] = b.[ID]
+from #SUBSET_BUILD a left join #FINAL b on a.Der_Unique_Record_ID = b.Der_Unique_Record_ID
+;
+
+
+--delete rows from table where [ID] is NULL
+--These records can not be assigned to an individual with 100% accuracy and without the risk of double-counting 
+--as the NHS ID is NULL and the LA ID is already present in the data associated to an NHS Number
+delete from #SUBSET_BUILD
+where [ID] is NULL
+;
+
+--------------------------------------------------------------------------------------------------------------------------
+
+
+--------------------------------------------------------------
+/*SELECT LATEST VERSION OF EACH EVENT USING BESPOKE EVENT ID*/
+--------------------------------------------------------------
+
+/*Use Concat of fields to create unique Event IDs for all Requests, in-line with how unique events are pin-pointed in 
+the DHSC CLD Dashboard and Principles Document. This ensures the latest edition of each Event is being used (i.e. latest submitted version)
+The CLD spec item Event Reference Number (ERN) has been used previously to distinguish unique events for this but local differences of how the 
+ERN is applied in CLD have meant that it is not always robust enough to use a a unique event identifier*/
+
+
+--Add column to all Service events containing CONCAT of fields as a bespoke unique Event ID
+--NOTE: Event_End_Date is ommitted from CONCAT as we want to try to pin-point old events with NULL end dates as part of this process
+drop table if exists #SERVICES_WITH_CONC
+select *
+, concat(LA_CODE, [ID], CLIENT_TYPE, EVENT_START_DATE, Service_Type, Service_Component, Delivery_Mechanism) as [SERVICE_CONC]
+into #SERVICES_WITH_CONC
+from #SUBSET_BUILD
+where Event_Type = 'Service'
+;
+
+
+
+drop table if exists #SERVICES_LATEST
+select *
+into #SERVICES_LATEST
+from 
+(
+select *
+, DENSE_RANK() OVER (PARTITION by [SERVICE_CONC] order by ImportDate desc) as RN
+from #SERVICES_WITH_CONC
+where ImportDate <= '2024-02-01' --After period of interest submission window closed
+) a
+where RN = 1
+;
+
+
+--Combine all the latest editions of Service Events back in with the rest of the non-Service event rows
+drop table if exists #SUBSET
+select *
+into #SUBSET
+from
+(
+select *
+from #SERVICES_LATEST
+union
+select *, 'NA' as [SERVICE_CONC], '0' as [Rn]
+from #SUBSET_BUILD
+where Event_Type not like 'Service'
+) a
+;
+
+
+------------------------------------------------------------------------------------------------------------------
+
+------------------------
+/*PRODUCE ST-MAX TABLE*/
+------------------------
+
+
+--------------------------
+/*FIND ALL ST-MAX EVENTS*/
+--------------------------
+/*ST_MAX event rows in #SUBSET table 
+
+These ST-Max records will be clustered together where appropriate, to avoid double-counting, using thresholds agreed with CLD SALT Working Group
+
+No maximum End Date is added yet and any NULL Event End Dates (i.e Open/ongoing ST-Max events) 
+are CASED here with todays date to ensure that the full cluster/chain of ST-MAX events is formed correctly
+No minimum End Date either to ensure that Events that are before the time period can still be used, if they form part of a chain
+of Events that latterly fall within the time period*/
+
+DECLARE
+  @StartDate DATE,
+  @EndDate   DATE
+
+SET @StartDate = '2023-04-01'  -- Complete as required
+SET @EndDate = '2023-12-31'    -- Complete as required
+
+
+drop table if exists #ST_MAX_BUILD
+select LA_CODE, [ID], Event_Start_Date
+, CASE WHEN Event_End_Date is NULL then CAST( GETDATE() AS Date) else Event_End_Date End as Event_End_Date
+, Event_Outcome
+into #ST_MAX_BUILD
+from #SUBSET a
+where Event_Type = 'Service'
+and Service_Type = 'Short Term Support: ST-Max'
+and (Date_of_Death >= @StartDate OR Date_of_Death is NULL) -- This filter removes Clients who have a recorded date of death at this stage
+group by LA_CODE, [ID], Event_Start_Date, Event_End_Date, Event_Outcome
+;
+
+
+
+-------------------------------------------------------------------------
+/*INCORPORATE 'ISLANDS AND GAPS' LOGIC INTO A BUILD OF THE ST-MAX TABLE*/
+-------------------------------------------------------------------------
+/*This piece of code looks at all of the ST-Max events recorded against a Client to try and determine whether any Events need to be clustered together
+and be counted as one distinct Reablement period.
+
+By ordering the ST-Max data chronologically earliest to latest for each Client (by LA), it is then possible to query the time elapsed between the End Date
+of one Event and the Start Date of another Event - for those Clients that have more than one in the period of interest.
+
+Code allows for breaks of 1 day, between one ST-Max event record ending and a subsequent one starting (see 'DATEADD' syntax). This threshold was agreed 
+in collaboration with analytical colleagues on the LA working group. Any 'Gap' longer than a day is considered a break and any activity after this
+point constitutes a new 'Island' or ST-Max Cluster
+*/
+drop table if exists #ST_MAX_With_Count
+SELECT distinct a.*, Islands.IslandID as [ST_MAX_COUNT]
+, MIN(a.Event_Start_Date) OVER (PARTITION BY a.LA_CODE, a.[ID], Islands.IslandID) as [MIN_START_DATE]
+into #ST_MAX_With_Count
+FROM #ST_MAX_BUILD a
+inner join
+    (
+    SELECT
+        *,
+        CASE WHEN Groups.PreviousEndDate >= DATEADD(DAY, -1, Event_Start_Date) THEN 0 ELSE 1 END AS IslandStartInd,
+        SUM(CASE WHEN Groups.PreviousEndDate >= DATEADD(DAY, -1, Event_Start_Date) THEN 0 ELSE 1 END) OVER (partition by LA_CODE, [ID] ORDER BY Groups.[ID], Groups.DRN) AS IslandId
+    FROM
+    (
+        SELECT
+			DENSE_RANK() OVER (partition by LA_CODE, [ID] ORDER BY Event_Start_Date, Event_End_Date) AS DRN,
+			LA_CODE,
+			[ID],
+            Event_Start_Date,
+            Event_End_Date,
+            LAG(Event_End_Date,1) OVER (partition by LA_CODE, [ID] ORDER BY Event_Start_Date,Event_End_Date) AS PreviousEndDate
+        FROM
+            #ST_MAX_BUILD
+    ) Groups
+) Islands
+on a.[ID] = Islands.[ID] and a.Event_Start_Date = Islands.Event_Start_Date and a.Event_End_Date = Islands.Event_End_Date
+order by a.LA_CODE, a.[ID], a.Event_Start_Date, Islands.IslandID
+;
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+
+/*Find the latest Event End Date associated with each newly-clustered ST-MAX record and pull only this through, as 'Cluster End Date'
+The Event Outcome of the latest event in each cluster can be will be referred back to when trying to determine the sequel to the ST-Max Event
+in cases where no sequel to the reablement can be found in the onward chronology.
+So we now have ST-Max Clusters with Start and End dates potentially taken from different ST-Max events*/
+drop table if exists #ST_MAX_Latest_End
+select distinct LA_CODE, [ID], MIN_START_DATE as [Cluster_Start_Date], Event_End_Date as [Cluster_End_Date], Event_Outcome, ST_MAX_COUNT
+into #ST_MAX_Latest_End
+from 
+(
+select *,
+DENSE_RANK() OVER (partition by LA_CODE, [ID], ST_MAX_COUNT ORDER BY Event_End_Date DESC) AS RN -- DESCENDING so RN '1' is always the option to filter for
+from #ST_MAX_with_Count
+) a
+where RN = 1
+order by LA_CODE, [ID], MIN_START_DATE, ST_MAX_COUNT
+;
+
+
+
+/*Now ST-Max chains/clusters have been fully formed, we can now select only those clusters that end within the time period
+Any NULL End Dates (i.e. Open event clusters) have been CASED with todays date in earlier #ST_MAX_BUILD table to enable their removal at this point*/
+drop table if exists #ST_MAX;
+select *
+into #ST_MAX
+from #ST_MAX_Latest_End
+where Cluster_End_Date between '2023-04-01' and '2023-12-31'
+;
+
+
+
+
+----------------------------------
+/*FILTERING FOR EXISTING CLIENTS*/
+----------------------------------
+
+/*STS002b is for existing Clients only. The distinction here is all Clients who had an open/ongoing
+Long Term Support Service in place at the time that the ST-Max Event started*/
+
+
+
+--Create table of Clients in receipt of LTS in the #ALL_EVENTS table
+drop table if exists #Service_Events;
+select LA_Code 
+,[ID]
+,Service_Type
+,Event_Start_Date
+,Event_End_Date
+into #Service_Events
+from #SUBSET
+where Service_Type in 
+(
+'Long Term Support: Nursing Care',
+'Long Term Support: Residential Care',
+'Long Term Support: Community',
+'Long Term Support: Prison'
+)
+group by
+LA_Code 
+,[ID]
+,Service_Type
+,Event_Start_Date
+,Event_End_Date
+;
+
+
+
+--Find ST-Max clusters where Client has an Open/Ongoing LTS
+--i.e. where ST-Max cluster starts between a Service Start and End Date, or (in case of open-ended/ongoing Services) after/on Service Start Date 
+drop table if exists #ONGOING
+select LA_CODE, [ID], Cluster_Start_Date, Cluster_End_Date, Event_Outcome, ST_MAX_COUNT
+into #ONGOING
+from
+(
+select a.*
+,b.[ID] as [Service_ID]
+,b.Event_Start_Date as Service_Start_Date 
+,b.Event_End_Date as Service_End_Date
+,b.Service_Type
+,case when a.Cluster_Start_Date between b.Event_Start_Date and b.Event_End_Date then 1
+when (a.Cluster_Start_Date >= b.Event_Start_Date and b.Event_End_Date is null) then 1
+else 0
+end as Service_Flag
+from #ST_MAX a
+left join #Service_Events b
+on a.[ID] = b.[ID] and a.LA_Code = b.LA_Code
+where b.[ID] is not null
+) x
+where Service_Flag = 1
+;
+
+
+
+--Only bring forward the ST-Max clusters for existing Clients i.e. Clients that have an open/ongoing Service at time of ST-Max starting
+drop table if exists #ST_MAX_EXISTING_CLIENTS
+select a.*
+into #ST_MAX_EXISTING_CLIENTS
+from #ST_MAX a
+inner join #ONGOING b on a.LA_CODE = b.LA_CODE and a.[ID] = b.[ID] and a.Cluster_Start_Date = b.Cluster_Start_Date and a.Cluster_End_Date = b.Cluster_End_Date
+and a.Event_Outcome = b.Event_Outcome and a.ST_MAX_COUNT = b.ST_MAX_COUNT
+;
+
+
+
+
+---------------------
+/*END OF PROCESSING*/
+---------------------
+
+
+
+
+---------------------------------------------------------------
+/*QUERY OF NUMBER OF ST_MAX EVENTS FOR EXISTING CLIENTS BY LA*/
+---------------------------------------------------------------
+select LA_CODE, count (distinct concat([ID], ST_MAX_COUNT))
+from #ST_MAX_EXISTING_CLIENTS
+group by LA_CODE

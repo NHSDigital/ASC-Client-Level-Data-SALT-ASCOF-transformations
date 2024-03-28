@@ -1,0 +1,262 @@
+----------------------------------------------------------------------------------------------
+/*ASCOF 2B/2C (Admissions)
+
+2B:  The number of adults aged 18 to 64 whose long-term support needs are met by admission to residential and 
+nursing care homes (per 100,000 population) (formerly metric 2A (1))
+
+DENOMINATOR: Size of younger adult population in area (ONS mid-year population estimates)
+NUMERATOR:   The number of adults aged 18 to 64 whose long-term support needs are met by admission to residential and 
+             nursing care homes
+OUTCOME: NUMERATOR over DENOMINATOR multiplied by 100,000
+
+
+
+
+2C:  The number of adults aged 65 and over whose long-term support needs are met by admission to residential and 
+nursing care homes (per 100,000 population) (formerly metric 2A (2))
+
+DENOMINATOR: Size of older people population in area (ONS mid-year population estimates)
+NUMERATOR:   The number of adults aged 65+ whose long-term support needs are met by admission to residential and 
+             nursing care homes
+OUTCOME:     NUMERATOR over DENOMINATOR multiplied by 100,000
+
+*/
+----------------------------------------------------------------------------------------------
+
+
+
+------------------------------------------------------------------
+/*CREATE INITIAL BUILD OF CURRENT RESIDENTIAL AND NURSING COHORT*/
+------------------------------------------------------------------
+DECLARE @SnapshotDate DATE;
+
+SET @SnapshotDate = '2024-04-01'; -- set as required
+
+--Create #RESNURS table
+drop table if exists #RESNURS_Build
+SELECT *
+,CAST((concat(Der_Birth_Year, '-', Der_Birth_Month, '-', '01')) as DATE) as [Der_DOB] -- Derived using 1st month as an arbitrary date
+,FLOOR((DATEDIFF (DAY, (CAST(concat(Der_Birth_Year, '-', Der_Birth_Month, '-', '01') as DATE)), @SnapshotDate))/365.25) as [Der_Age_Snapshot_Date]--Derived Age as per Snapshot -- Derived age at snapshot date using Der_DOB
+INTO #RESNURS_Build 
+FROM [DHSC_ASC].[CLD_R1_Raw]
+where  Event_Type = 'Service' 
+AND Client_Type = 'Service User' 
+AND (Service_Type = 'Long Term Support: Residential Care' or Service_Type = 'Long Term Support: Nursing Care') 
+and (Der_Birth_Month is not NULL and Der_Birth_Year is not NULL)
+;
+
+
+-----------------------------------------
+/*CREATE AMALGAMATED NHS/LA IDENTIFIER*/
+-----------------------------------------
+/*initially, find all individuals with an NHS Number and stage into a temporary table*/                            
+drop table if exists #uniquenhs
+SELECT DISTINCT Der_Unique_Record_ID, Der_NHS_Number_Traced_Pseudo, Der_LA_Person_Unique_Identifier_Pseudo, 'NHS' as [Source]                                                                                                                                                     
+INTO #uniquenhs                                                                                                                                                           
+FROM #RESNURS_Build                                                                                                                                               
+where Der_NHS_Number_Traced_Pseudo is not NULL                                                                                          
+;
+
+
+/*where the NHS Number is missing, pull through all individuals LA Unique ID
+except in those cases where the LA Unique ID is already present and associated with an individual in #uniquenhs*/
+drop table if exists #missingnhs
+SELECT distinct a.Der_Unique_Record_ID, a.Der_NHS_Number_Traced_Pseudo, a.Der_LA_Person_Unique_Identifier_Pseudo, 'LA' as [Source]                                                                             
+INTO #missingnhs                                                                                                                                                           
+FROM #RESNURS_Build  a                                                                                                                                                
+left join #uniquenhs b on a.Der_LA_Person_Unique_Identifier_Pseudo = b.Der_LA_Person_Unique_Identifier_Pseudo                                                                                                          
+where a.Der_NHS_Number_Traced_Pseudo is NULL                                                                                              
+and b.Der_LA_Person_Unique_Identifier_Pseudo is NULL                                                                                     
+;
+
+
+/*Stack the NHS IDs and the LA IDs from the two temp tables underneath each other in a final table, as an amalgamated 'ID' field*/
+drop table if exists #FINAL
+select distinct Der_Unique_Record_ID, Der_NHS_Number_Traced_Pseudo as [ID], [Source]                                     
+into #FINAL                                                                                                                                                                     
+from #uniquenhs                                                                                                                                                           
+UNION                                                                                                                                                               
+select distinct Der_Unique_Record_ID, Der_LA_Person_Unique_Identifier_Pseudo as [ID], [Source]                        
+from #missingnhs
+;
+
+
+/*Add a column to Raw table with the new ID field*/
+alter table #RESNURS_Build add [ID] nvarchar (200)
+GO
+;
+update a
+set a.[ID] = b.[ID]
+from #RESNURS_Build  a left join #FINAL b on a.Der_Unique_Record_ID = b.Der_Unique_Record_ID
+;
+
+/*delete rows from table where [ID] is NULL
+These records can not be assigned to an individual with 100% accuracy and without the risk of double-counting 
+as the NHS ID is NULL and the LA ID is already present in the data associated to an NHS Number*/
+delete from #RESNURS_Build
+where [ID] is NULL
+;
+
+-----------------------------------------------------------------------------------------------------------------
+
+
+-------------------
+/*CREATE EVENT_ID*/
+-------------------
+/*A bespoke Event ID is created here to pin-point unique Events in the data. This is done using a combination of several fields as a 
+concatenation. CLD spec items 'Event Reference Number' (ERN) has been used previously for this but local differences of how the ERN is applied in CLD have meant
+that it is not always robust enough to use a a unique event identifier.
+This approach is consistent with how unique Events are created in the DHSC CLD Power BI Dashboard, although the de-duplication rules used in the
+dashboard differ from the SALT methodology adhered to in this code script
+NOTE: the fields used in the concatenation below are specfically for dealing with SERVICE events. The field combinations differ by Event Type*/
+alter table #RESNURS_Build add [Event_ID] nvarchar(200)
+GO
+;
+update #RESNURS_Build
+set [Event_ID] = CONCAT(LA_CODE, [ID], Event_Start_Date, Client_Type, Service_Type, Service_Component, Delivery_Mechanism)
+;
+
+
+-----------------------------------------------------------
+/*APPLY DATE FILTER TO CREATE FINAL RES AND NURSING TABLE*/
+-----------------------------------------------------------
+
+--Correct End Date filter can now be added i.e. Events cannot have ended before the snapshot
+--Must be done after EVENT_ID has been created for next 'UPDATED RECORDS' process to work
+DECLARE
+  @SnapshotDate DATE
+;
+
+
+SET @SnapshotDate = '2024-04-01' --set snapshot date
+
+drop table if exists #RESNURS
+select *
+into #RESNURS
+from #RESNURS_Build
+where (Event_End_Date >= @SnapshotDate or Event_End_Date is NULL)
+;
+
+
+
+
+----------------------------------------------------------------------------------------------------------------------------
+
+
+----------------------------------------------------------------------------------
+/*UPDATED RECORDS: PROCESS TO REMOVE 'OPEN' EVENTS SUBSEQUENTLY MARKED AS CLOSED*/
+----------------------------------------------------------------------------------
+
+/*This process is designed to remove Events that are in CLD as 'Open' as per the period of interest, but
+have been supplanted/superseded by a more up-to-date edition of the record that indicates the Event has closed.
+
+This occurs due to how the data lands and is stored i.e. records are continually stacked and no 'old' records are ever deleted or amended.
+
+This process is based on the EVENT_ID concatenation field. For this reason, if one field in the concatenation has altered even slightly
+then a new EVENT_ID has been generated and the process below will not be successful in identifying this activity as the same Event*/
+
+
+/*Select the latest version of each event, as per the latest ImportDate, and move any Events recorded as closed into the #CLOSED_EVENTS table. 
+Process needs to be undertaken on the #Build table initially as this contains the historical data pre-dating the period of interest*/
+drop table if exists #CLOSED_EVENTS
+select distinct a.EVENT_ID, b.Latest_Event_Submission
+into #CLOSED_EVENTS
+from #RESNURS_Build a
+inner join 
+(
+select EVENT_ID, MAX(ImportDate) as 'Latest_Event_Submission'
+from #RESNURS_Build
+where ImportDate < '2024-05-01' -- set submission date. Only submissions within the relevant CLD submission window can be considered
+group by EVENT_ID
+) b
+on a.Event_ID = b.Event_ID and a.ImportDate = b.Latest_Event_Submission
+inner join #RESNURS c on a.Event_ID = c.Event_ID
+where a.Event_End_Date < '2024-04-01' -- enter snapshot date
+;
+
+
+/*In some cases, Event IDs in the #CLOSED_EVENTS table also have a matching entry in the same latest submission that are NOT closed. 
+These need flagging as not closed or 're-opened' in order that they are not removed from the LTS001a_Raw table*/
+drop table if exists #REOPENED
+select distinct a.EVENT_ID, b.Latest_Event_Submission
+into #REOPENED
+from #RESNURS_Build a
+inner join #CLOSED_EVENTS b
+on a.Event_ID = b.Event_ID and a.ImportDate = b.Latest_Event_Submission
+where (a.Event_End_Date >= '2024-04-01' or a.Event_End_Date is NULL) --enter snapshot date
+;
+
+
+/*Remove from the #LTS001a_Raw table all EVENT_IDs that are IN the #CLOSED_EVENTS table and NOT IN the #REOPENED table
+i.e the latest indication is that these Events have closed, and not re-opened, thus they are out of scope for this cohort*/
+delete from #RESNURS
+where EVENT_ID in
+(
+select Event_ID
+from #CLOSED_EVENTS
+)
+and EVENT_ID not in
+(
+select Event_ID
+from #REOPENED
+) 
+
+
+----------------------------------------------------------------------------------------------------------------------------
+
+
+
+----------------------------
+/*CREATE ADMISSION NUMBERS*/
+----------------------------
+
+--Create Previous Admissions i.e. any Client in the Res/Nursing cohort whose Res/Nursing Service began over a year before the snapshot date
+drop table if exists #PREVIOUSADMISSIONS
+ SELECT DISTINCT [ID], LA_Code, [Der_Age_Snapshot_Date] 
+INTO #PREVIOUSADMISSIONS 
+FROM #RESNURS
+where Event_Start_Date < '2023-04-01'
+
+
+--Create a subset of the Res/Nursing cohort to only include those Services which started within the period of interest
+drop table if exists #ADMISSIONS 
+SELECT DISTINCT [ID], LA_Code, [Der_Age_Snapshot_Date] 
+INTO #ADMISSIONS 
+FROM #RESNURS
+where Event_Start_Date >= '2023-04-01'and Event_Start_Date  < '2024-04-01'
+
+
+
+--join the two tables and only retain rows for those individuals who started a nursing/residential service during the period in question 
+--but DIDN'T have any record of previous admissions
+drop table if exists #RESNURS_Final
+SELECT distinct a.[ID], a.LA_Code, a.[Der_Age_Snapshot_Date]
+INTO #RESNURS_Final
+FROM #ADMISSIONS a
+left join #PREVIOUSADMISSIONS b on a.[ID] = b.[ID]
+where b.[ID] is NULL
+
+
+
+-------------------------------
+--CREATE ASCOF 2B NUMERATOR
+-------------------------------
+drop table if exists #ASCOF_2B_Numerator
+SELECT LA_Code, COUNT([ID]) as 'Total'
+into #ASCOF_2B_Numerator
+from #RESNURS_Final
+where Der_Age_Snapshot_Date between 18 and 64
+group by LA_Code
+
+
+
+-------------------------------
+--CREATE ASCOF 2C NUMERATOR
+-------------------------------
+drop table if exists #ASCOF_2C_Numerator
+SELECT LA_Code, COUNT([ID]) as 'Total'
+into #ASCOF_2C_Numerator
+from #RESNURS_Final
+where Der_Age_Snapshot_Date > 64
+group by LA_Code
+

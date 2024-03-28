@@ -1,0 +1,1088 @@
+------------------------------------------------------------------------------------------------------------------------------------------------
+/*ASCOF 3D: Proportion of people using social care who receive self-directed support, and those receiving direct payments (formerly metric 1C)*/
+------------------------------------------------------------------------------------------------------------------------------------------------
+
+-----------------------------------------------------------------------------
+/* 
+This ASCOF measure is 4 parts, 2 x Client scores and 2 x Carers scores
+
+
+**CLIENT BASED PARTS**
+Denominator (3D Part 1a and 2a) = All Community-based Clients
+Numerator (3D Part 1a) = Clients receiving self-directed support
+Numerator (3D Part 2a) = Clients receiving Direct Payments only
+Outcome = Numerator / Denominator * 100
+
+
+**CARER BASED PARTS**
+Denominator (3D Part 1b and 2b) = All Community-based Carers
+Numerator (3D Part 1b) = Carers receiving self-directed support
+Numerator (3D Part 2b) = Carers receiving Direct Payments only
+Outcome = Numerator / Denominator * 100
+
+-----------------------------------------------------------------------------
+
+------------------------------------------------------------------------
+
+The code is written to run through and create the Client-based measures 3D1a and 3D2a first and then the Carers measures
+3D1b and 3D2b afterwards, before appending them all into one final ASCOF 3D Asset.
+
+Period of interest dates will need to be entered for the Client table build at the beginning and then further down for the Carer 
+table build. Dates are a snapshot for Clients, and in-year for Carers, as per ASCOF Handbook
+
+
+
+**CLIENT BASED PARTS**
+Code to produce the Client based measures is taken directly from LTS001b code process, with some adaptations
+
+The full LTS001b code process must run through even though ASCOF 3D is only concerned with Community-based Clients.
+This is to allow for de-duplication to occur based on setting, so the cohort matches the LTS001b SALT cohort, where
+all Clients present in multiple settings as at the snapshot date are placed in the highest category as per the SALT
+setting hierarchy i.e. Residential setting out-ranks Community, Nursing out-ranks Residential etc
+
+Technically at a snapshot date, a Client should not be recorded against multiple conflicting settings, but this does
+occur in the data submitted
+
+De-duplication based on PSR (which is performed in the LTS001b code) is not needed here as ASCOF 3D is not reported
+by PSR so these code routines have been removed
+
+
+
+**CARER BASED PARTS**
+Code to produce the Carer based measures is taken directly from the high-level LTS003 replication script. It is a slice
+of this dataset, using only the Service Type of 'Carer Support: Direct to Carer'
+
+The full LTS003 code process must run through even though ASCOF 3D is only concerned with Direct Payment / self-directed Carers
+This is to allow for de-duplication to occur based on support provided, so the cohort matches the LTS003 SALT cohort, where
+Carers receiving multiple conflicting support types as at the snapshot date are placed in the highest category as per the SALT
+setting hierarchy i.e. Direct Payment out-ranks CASSR Managed Personal Budget
+
+
+
+NOTE: The ASCOF Handbook only specifies all adults aged over 18. Previously NHS Digital has published this measure by 18-64 and 65+ agebands, so 
+this is included in the code below. If these age breakdowns are no longer needed then the '_Total' (i.e. all ages)final tables for Clients 
+and Carers can be used
+
+*/
+
+
+
+
+----------------------------------------------------------------------------------------------------------------
+/*CREATE REFERENCE TABLE #REF_SERVICE_TYPE_DELIVERY_MECH TO CATEGORISE AND RANK ITEMS FOR DISTINCT INDIVIDUALS*/
+----------------------------------------------------------------------------------------------------------------
+drop table if EXISTS #REF_Service_Type_Delivery_Mech	
+create table #REF_Service_Type_Delivery_Mech
+(Service_Type varchar(200)
+,Delivery_Mechanism varchar(200)
+,SALT_Category varchar(200)
+,SALT_Broad_Category varchar(200)
+,Sort_Order int
+,Hierarchy int)
+
+insert into #REF_Service_Type_Delivery_Mech
+(Service_Type
+,Delivery_Mechanism
+,SALT_Category
+,SALT_Broad_Category
+,Sort_Order
+,Hierarchy
+)
+values
+('Long Term Support: Nursing Care', '', 'Nursing', 'Nursing', 1, 1)
+,('Long Term Support: Residential Care', '', 'Residential', 'Residential', 2, 2)
+,('Long Term Support: Community', 'Direct Payment', 'Community: Direct Payment', 'Community', 3, 3)
+,('Long Term Support: Community', 'CASSR Managed Personal Budget', 'Community: CASSR Managed Personal Budget', 'Community', 4, 4)
+,('Long Term Support: Community', 'CASSR Commissioned Support', 'Community: CASSR Commissioned Support', 'Community', 5, 5)
+,('Long Term Support: Community', '', 'Community', 'Community', 6, 6)
+,('Long Term Support: Prison', 'CASSR Managed Personal Budget', 'Prison: CASSR Managed Personal Budget', 'Prison', 7, 7)
+,('Long Term Support: Prison', 'CASSR Commissioned Support', 'Prison: CASSR Commissioned Support', 'Prison', 8, 8)
+,('Long Term Support: Prison', '', 'Prison', 'Prison', 9, 9)
+;
+
+
+---------------------------------------------------------------------------------------------------
+/*CREATE REFERENCE TABLE #REF_DELIVERY_MECH TO CATEGORISE AND RANK ITEMS FOR CARERS*/
+---------------------------------------------------------------------------------------------------
+--This Reference table will be used to de-duplicate Carers later in the process when they appear more than once in the period of interest
+--with conflicting support types. Each Carer can only be counted once as per SALT LTS003 so a hierarchy is applied.
+--NOTE: Check periodically to ensure the Defined List in CLD spec has not changed!
+drop table if exists #REF_CARER_SUPPORT_HIERARCHY
+create table #REF_CARER_SUPPORT_HIERARCHY
+(
+Support_Provided varchar(200)
+,Sort_Order int
+,Hierarchy int
+)
+;
+
+insert into #REF_CARER_SUPPORT_HIERARCHY
+(
+Support_Provided
+,Sort_Order
+,Hierarchy
+)
+values
+('Direct Payment only', 1, 1)
+,('CASSR Managed Personal Budget', 2, 2)
+,('CASSR Commissioned Support only', 3, 3)
+,('Support Direct to Carer: Unknown Delivery Mech', 4, 4)
+,('Information, Advice and Other Universal Services / Signposting', 5, 5)
+,('No Direct Support Provided to Carer', 6, 6)
+;
+
+
+
+--------------------------------------------------------------------------
+/*CREATE TABLE RETURNING LATEST SUBMISSION WITHIN THE PERIOD OF INTEREST*/
+--------------------------------------------------------------------------
+/*
+This code uses a procedure at the beginning to determine the last file submission
+from each LA within the window, on the understanding that this was a Final and complete submission.
+
+This process helps to cut down on duplicates and also ensure that the latest edition of each Event is selected.
+Because the CLD submissions append/stack and no old data is deleted, then without running a process such as this below previous 
+iterations of old events that have subsequently been updated and/or closed will come through 
+e.g an event entered onto the system in 2022 showing as open (no Event End Date) will pass through the date filters later on in the process
+despite a more recent LA submission in 2024 showing that the same Event ended/closed in 2023.
+
+Set the date parameters for period of interest at the end of the query as per the annotated instructions
+*/
+
+drop table if exists #Latest_Submission
+  SELECT DISTINCT
+    LA_Name,
+    ImportDate
+     INTO #Latest_Submission
+  FROM (
+    SELECT
+      *,
+      ROW_NUMBER() OVER(PARTITION BY LA_Name, LA_Code ORDER BY ImportDate DESC) row
+    FROM (
+      SELECT
+        LA_Name,
+        LA_Code,
+        ImportDate,
+        MIN(Reporting_Period_Start_Date) Reporting_Period_Start_Date,
+        MAX(Reporting_Period_End_Date) Reporting_Period_End_Date
+ 
+	  FROM [DHSC_ASC].[CLD_R1_Raw]
+	  	  WHERE LA_Name IS NOT NULL
+      GROUP BY
+        LA_Name,
+        LA_Code,
+        ImportDate
+    ) a
+    WHERE Reporting_Period_Start_Date <= '2023-04-01' --beginning of Q1 of year of interest (always 1st April where snapshot or in-year)
+    AND Reporting_Period_End_Date >= '2023-12-31' --end of period of interest (enter snapshot date here if snapshot required)
+    AND ImportDate > '2023-12-31' --should be after the Reporting Period End Date (when LAs can submit data from)
+    AND CONVERT(date, ImportDate) <= '2024-03-01' --user can specify how late submissions can be accepted from (submission window closes 1month after quarter end)
+  ) b
+  WHERE row = 1
+
+/*
+Worked Example:
+
+For 2023/24 SALT publications
+The 'in-year' i.e. whole financial year period 23/24 (e.g. for LTS001a) 
+and also the snapshot 31st March 2024 (e.g. for LTS001b)
+would be 
+
+    WHERE Reporting_Period_Start_Date <= '2023-04-01'
+    AND Reporting_Period_End_Date >= '2024-03-31'
+    AND ImportDate > '2024-04-31'
+    AND CONVERT(date, ImportDate) <= '2024-05-01'
+
+*/
+
+
+
+
+
+-------------------------------------------------------------------------------
+/*FILTER DATA APPROPRIATELY FOR ASCOF 3D INDIVIDUALS AND SELECT SNAPSHOT DATE*/
+-------------------------------------------------------------------------------
+DECLARE
+  @SnapshotDate DATE
+;
+
+
+SET @SnapshotDate = '2023-12-31'  -- Complete as required
+;
+
+drop table if EXISTS #ASCOF_3D_Clients_Build
+select a.*
+, CAST((concat(Der_Birth_Year, '-', Der_Birth_Month, '-', '01')) as DATE) as [Der_DOB] -- Derived using 1st of the month as an arbitrary date
+, FLOOR((DATEDIFF (DAY, (CAST(concat(Der_Birth_Year, '-', Der_Birth_Month, '-', '01') as DATE)), @SnapshotDate))/365.25) as [Der_Age_Snapshot_Date] -- Derived age at snapshot date using Der_DOB
+into #ASCOF_3D_Clients_Build
+from [DHSC_ASC].[CLD_R1_Raw] a
+inner join #Latest_Submission b on a.LA_Name = b.LA_Name and a.ImportDate = b.ImportDate -- Only take latest (i.e. Final) submission within period of interest
+where 
+[Service_Type] in ('Long Term Support: Nursing Care', 'Long Term Support: Residential Care', 'Long Term Support: Community', 'Long Term Support: Prison')
+and Client_Type = 'Service User'
+and Event_Start_Date <= @SnapshotDate
+and (Event_End_Date >= @SnapshotDate or Event_End_Date is NULL)
+and (Date_of_Death >= @SnapshotDate OR Date_of_Death is NULL) 
+and (Der_Birth_Month is not NULL and Der_Birth_Year is not NULL) --Only small amount currently but they stop the CAST functions from working. See query below to extract and analyse Unknown
+;
+
+
+
+--/*Staging table allowing for analysis of Unknown Age records*/
+--drop table if exists #ASCOF_3D_Clients_Build_UnknownAges
+--select a.*
+--into #ASCOF_3D_Clients_Build_UnknownAges
+--from [DHSC_ASC].[CLD_R1_Raw] a
+--inner join #Latest_Submission b on a.LA_Name = b.LA_Name and a.ImportDate = b.ImportDate -- Only take latest (i.e. Final) submission within period of interest
+--where [Service_Type] in ('Long Term Support: Nursing Care', 'Long Term Support: Residential Care', 'Long Term Support: Community', 'Long Term Support: Prison')
+--and Client_Type = 'Service User'
+--and Event_Start_Date <= @SnapshotDate --No End Date yet until amalgamated [ID] has been created 
+--and (Date_of_Death >= @SnapshotDate OR Date_of_Death is NULL) 
+--and (Der_Birth_Month is NULL or Der_Birth_Year is NULL) 
+--;
+
+
+
+----------------------------------------
+/*CREATE AMALGAMATED NHS/LA IDENTIFIER*/
+----------------------------------------
+
+/*Process used to create unique person ID, taking the NHS Number wherever possible and then deferring to the LA ID to back-fill NHS Number gaps wherever possible*/
+
+/*initially, find all individuals with an NHS Number and stage into a temporary table*/                               
+drop table if exists #uniquenhs
+SELECT DISTINCT Der_Unique_Record_ID, Der_NHS_Number_Traced_Pseudo, Der_LA_Person_Unique_Identifier_Pseudo, 'NHS' as [Source]                                                                                                                                                     
+INTO #uniquenhs                                                                                                                                                           
+FROM #ASCOF_3D_Clients_Build                                                                                                                                                 
+where Der_NHS_Number_Traced_Pseudo is not NULL                                                                                          
+;
+
+
+/*where the NHS Number is missing, pull through all individuals LA Unique ID
+except in those cases where the LA Unique ID is already present and associated with an individual in #uniquenhs*/
+drop table if exists #missingnhs
+SELECT distinct a.Der_Unique_Record_ID, a.Der_NHS_Number_Traced_Pseudo, a.Der_LA_Person_Unique_Identifier_Pseudo, 'LA' as [Source]                                                                             
+INTO #missingnhs                                                                                                                                                           
+FROM #ASCOF_3D_Clients_Build a                                                                                                                                                
+left join #uniquenhs b on a.Der_LA_Person_Unique_Identifier_Pseudo = b.Der_LA_Person_Unique_Identifier_Pseudo                                                                                                          
+where a.Der_NHS_Number_Traced_Pseudo is NULL                                                                                              
+and b.Der_LA_Person_Unique_Identifier_Pseudo is NULL                                                                                     
+;
+
+
+/*Stack the NHS IDs and the LA IDs from the two temp tables underneath each other in a final table, as an amalgamated 'ID' field*/
+drop table if exists #FINAL
+select distinct Der_Unique_Record_ID, Der_NHS_Number_Traced_Pseudo as [ID], [Source]                                     
+into #FINAL                                                                                                                                                                     
+from #uniquenhs                                                                                                                                                           
+UNION                                                                                                                                                               
+select distinct Der_Unique_Record_ID, Der_LA_Person_Unique_Identifier_Pseudo as [ID], [Source]                        
+from #missingnhs
+;
+
+
+/*Add a column to Raw table with the new ID field*/
+alter table #ASCOF_3D_Clients_Build add [ID] nvarchar (200)
+GO
+;
+update a
+set a.[ID] = b.[ID]
+from #ASCOF_3D_Clients_Build a left join #FINAL b on a.Der_Unique_Record_ID = b.Der_Unique_Record_ID
+;
+
+/*delete rows from table where [ID] is NULL
+These records can not be assigned to an individual with 100% accuracy and without the risk of double-counting 
+as the NHS ID is NULL and the LA ID is already present in the data associated to an NHS Number*/
+delete from #ASCOF_3D_Clients_Build
+where [ID] is NULL
+;
+
+-----------------------------------------------------------------------------------------------------------------
+
+
+
+-----------------------------------------------------------------------------------------
+/*OVER-WRITE ANY INVALID OR UNEXPECTED ENTRIES IN THE DELIVERY MECHANISM COLUMN TO ''  */
+-----------------------------------------------------------------------------------------
+--Delivery Mechanism is currently NOT a mandatory field and so we can not remove records based on inaccuracy in this field
+--but leaving invalid/unexpected entries in the field will cause problems with the Reference data join. 
+--Solution to this is to blank out ('') any entries that are invalid or where a Delivery Mechanism is not expected (Nursing and Res events)
+update a
+set a.Delivery_Mechanism = 
+(CASE WHEN b.Delivery_Mechanism is not NULL and a.Service_Type in ('Long Term Support: Community', 'Long Term Support: Prison') then a.Delivery_Mechanism 
+	  ELSE '' 
+	  end)
+from #ASCOF_3D_Clients_Build a
+left join #REF_Service_Type_Delivery_Mech b on trim (a.[Service_type]) = trim (b.[Service_Type])
+and trim (a.Delivery_Mechanism) = trim (b.[Delivery_Mechanism])
+;
+
+
+-------------------------------------------------------------------------------------------------------------------
+
+
+------------------------------------------------------
+/*CLIENTS PROCESSING, FILTERING AND DE-DUPLICATION*/
+------------------------------------------------------
+
+/* 
+The Client-based ASCOF 3D measures are processed as per SALT
+In SALT each Client can only be counted once in each LTS table so de-duplication routines are needed to achieve this, where a Client
+is present in the period of interest with multiple settings. Code below joins to the Hierarchy/Rank reference data and chooses the record 
+with the lowest 'Rank' in Service_Type/Delivery_Mech Hierarchy as per the REF data 
+
+This needs doing to avoid a scenario where, upon just filtering for 'Direct Payment' clients from the raw data, a Client is included in the 
+Direct Payment cohort despite being also present in the data with a higher severity/acuity of setting e.g. Nursing or Residential
+*/
+
+-----------------------------------------------------
+/*CREATE INITIAL TABLE JOIN TO REF DATA FOR CLIENTS*/
+-----------------------------------------------------
+--NOTE: CASE statement is needed here to capture all Community Service events where Service_Component is 'Direct Payment' as this is not covered
+--by the SALT #REF table
+drop table if exists #ASCOF_3D_Clients_Join
+select a.*
+,b.[Sort_Order]
+, CASE WHEN a.Service_Type = 'Long Term Support: Community' and Service_Component = 'Direct Payment' then '3' ELSE b.[Hierarchy] END as [Hierarchy]
+into #ASCOF_3D_Clients_Join
+from #ASCOF_3D_Clients_Build a
+left join #REF_Service_Type_Delivery_Mech b on trim (a.[Service_type]) = trim (b.[Service_Type])
+and trim (a.Delivery_Mechanism) = trim (b.[Delivery_Mechanism])
+;
+
+
+
+----------------------------
+/*AGED 18-64 INITIAL BUILD*/
+----------------------------
+/*Create raw 18-64 table*/
+drop table if EXISTS #ASCOF_3D_Clients_1864
+select *
+into #ASCOF_3D_Clients_1864
+from #ASCOF_3D_Clients_Join a
+where Der_Age_Snapshot_Date between 18 and 64 -- Using the Derived Age field created from Month and Year of Birth
+;
+
+
+/*Choose the record with the lowest 'Rank' in Service_Type/Delivery_Mech Hierarchy as per the REF data*/
+drop table if EXISTS #ASCOF_3D_Clients_1864_MinRank
+SELECT LA_Code, [ID],  Min(Hierarchy) as [RANK]
+into #ASCOF_3D_Clients_1864_MinRank
+FROM #ASCOF_3D_Clients_1864
+GROUP BY LA_Code, [ID]
+;
+
+
+/*Select these records into the 'Build' table*/
+drop table if EXISTS #ASCOF_3D_Clients_1864_Build
+SELECT a.LA_Code, a.[ID], a.Service_Type, a.Service_Component, a.[Delivery_Mechanism]
+into #ASCOF_3D_Clients_1864_Build
+from #ASCOF_3D_Clients_1864 a
+left join #ASCOF_3D_Clients_1864_MinRank b on a.[ID] = b.[ID] and a.[Hierarchy] = b.[RANK]
+where b.[RANK] is not NULL
+group by a.LA_Code, a.[ID], a.Service_Type, a.Service_Component,  a.[Delivery_Mechanism]
+;
+
+
+
+----------------------------
+/*CREATE 18-64 DENOMINATOR*/
+----------------------------
+--Filter for Community based only
+drop table if EXISTS #ASCOF_3D_Clients_1864_DENOM
+select LA_CODE, count(distinct [ID]) as [1864_Denom]
+into #ASCOF_3D_Clients_1864_DENOM
+from #ASCOF_3D_Clients_1864_Build
+where Service_Type = 'Long Term Support: Community'
+group by LA_CODE
+;
+
+
+---------------------------
+/*CREATE 18-64 NUMERATORS*/
+---------------------------
+
+--3D Part 1a: Self-Directed Support
+--Choose all Community clients receiving self-directed support (Direct Payment or a CASSR Managed Personal Budget)
+--Delivery Mechanism and Service Component are used here to ensure full coverage (Delivery Mechanism is not a mandatory field)
+drop table if EXISTS #ASCOF_3D1a_1864_NUM
+select LA_CODE, count(distinct [ID]) as [3D1a_1864_Num]
+into #ASCOF_3D1a_1864_NUM
+from #ASCOF_3D_Clients_1864_Build
+where Service_Type = 'Long Term Support: Community'
+and (([Delivery_Mechanism] = 'Direct Payment' or [Service_Component] = 'Direct Payment') or ([Delivery_Mechanism] = 'CASSR Managed Personal Budget'))
+group by LA_CODE
+;
+
+
+
+--3D Part 2a: Direct Payment
+--Choose all Community clients receiving a Direct Payment
+--Delivery Mechanism and Service Component are used here to ensure full coverage (Delivery Mechanism is not a mandatory field)
+drop table if EXISTS #ASCOF_3D2a_1864_NUM
+select LA_CODE, count(distinct [ID]) as [3D2a_1864_Num]
+into #ASCOF_3D2a_1864_NUM
+from #ASCOF_3D_Clients_1864_Build
+where Service_Type = 'Long Term Support: Community'
+and ([Delivery_Mechanism] = 'Direct Payment' or [Service_Component] = 'Direct Payment')
+group by LA_CODE
+;
+
+
+
+----------------------------
+/*CREATE FINAL 18-64 TABLE*/
+----------------------------
+--Denominator, Numerator and Outcome(%)
+drop table if EXISTS #ASCOF_3D_Clients_1864_FINAL
+select a.LA_CODE, a.[1864_Denom], b.[3D1a_1864_Num], c.[3D2a_1864_Num]
+,ROUND(CAST(b.[3D1a_1864_Num] AS Decimal) / CAST(a.[1864_Denom] AS Decimal) * 100,1) as '3D1a_1864_Outcome'
+,ROUND(CAST(c.[3D2a_1864_Num] AS Decimal) / CAST(a.[1864_Denom] AS Decimal) * 100,1) as '3D2a_1864_Outcome'
+into #ASCOF_3D_Clients_1864_FINAL
+from #ASCOF_3D_Clients_1864_DENOM a
+left join #ASCOF_3D1a_1864_NUM b on a.LA_CODE = b.LA_CODE
+left join #ASCOF_3D2a_1864_NUM c on a.LA_CODE = c.LA_CODE
+group by a.LA_CODE, a.[1864_Denom], b.[3D1a_1864_Num], c.[3D2a_1864_Num]
+,ROUND(CAST(b.[3D1a_1864_Num] AS Decimal) / CAST(a.[1864_Denom] AS Decimal) * 100,1)
+,ROUND(CAST(c.[3D2a_1864_Num] AS Decimal) / CAST(a.[1864_Denom] AS Decimal) * 100,1)
+;
+
+
+
+--------------------------
+/*AGED 65+ INITIAL BUILD*/
+--------------------------
+/*Create raw 65+ table*/
+drop table if EXISTS #ASCOF_3D_Clients_65Over
+select *
+into #ASCOF_3D_Clients_65Over
+from #ASCOF_3D_Clients_Join
+where Der_Age_Snapshot_Date > 64 -- Using the Derived Age field created from Month and Year of Birth
+;
+
+
+/*Choose the record with the lowest 'Rank' in Service_Type/Delivery_Mech Hierarchy as per the REF data*/
+drop table if EXISTS #ASCOF_3D_Clients_65Over_MinRank
+SELECT LA_Code, [ID],  Min(Hierarchy) as [RANK]
+into #ASCOF_3D_Clients_65Over_MinRank
+FROM #ASCOF_3D_Clients_65Over
+GROUP BY LA_Code, [ID]
+;
+
+
+/*Select these records into the 'Build' table*/
+drop table if EXISTS #ASCOF_3D_Clients_65Over_Build
+SELECT a.LA_Code, a.[ID], a.Service_Type, a.Service_Component, a.[Delivery_Mechanism]
+into #ASCOF_3D_Clients_65Over_Build
+from #ASCOF_3D_Clients_65Over a
+left join #ASCOF_3D_Clients_65Over_MinRank b on a.[ID] = b.[ID] and a.[Hierarchy] = b.[RANK]
+where b.[RANK] is not NULL
+group by a.LA_Code, a.[ID], a.Service_Type, a.Service_Component,  a.[Delivery_Mechanism]
+;
+
+
+
+
+
+----------------------------
+/*CREATE 65+ DENOMINATOR*/
+----------------------------
+--Filter for Community based only 
+drop table if EXISTS #ASCOF_3D_Clients_65Over_DENOM
+select LA_CODE, count(distinct [ID]) as [65Over_Denom]
+into #ASCOF_3D_Clients_65Over_DENOM
+from #ASCOF_3D_Clients_65Over_Build
+where Service_Type = 'Long Term Support: Community'
+group by LA_CODE
+;
+
+
+-------------------------
+/*CREATE 65+ NUMERATORS*/
+-------------------------
+
+--3D Part 1a: Self-Directed Support
+--Choose all Community clients receiving self-directed support (Direct Payment or a CASSR Managed Personal Budget)
+--Delivery Mechanism and Service Component are used here to ensure full coverage (Delivery Mechanism is not a mandatory field)
+drop table if EXISTS #ASCOF_3D1a_65Over_NUM
+select LA_CODE, count(distinct [ID]) as [3D1a_65Over_Num]
+into #ASCOF_3D1a_65Over_NUM
+from #ASCOF_3D_Clients_65Over_Build
+where Service_Type = 'Long Term Support: Community'
+and (([Delivery_Mechanism] = 'Direct Payment' or [Service_Component] = 'Direct Payment') or ([Delivery_Mechanism] = 'CASSR Managed Personal Budget'))
+group by LA_CODE
+;
+
+
+
+--3D Part 2a: Direct Payment
+--Choose all Community clients receiving a Direct Payment
+--Delivery Mechanism and Service Component are used here to ensure full coverage (Delivery Mechanism is not a mandatory field)
+drop table if EXISTS #ASCOF_3D2a_65Over_NUM
+select LA_CODE, count(distinct [ID]) as [3D2a_65Over_Num]
+into #ASCOF_3D2a_65Over_NUM
+from #ASCOF_3D_Clients_65Over_Build
+where Service_Type = 'Long Term Support: Community'
+and ([Delivery_Mechanism] = 'Direct Payment' or [Service_Component] = 'Direct Payment')
+group by LA_CODE
+;
+
+
+
+--------------------------
+/*CREATE FINAL 65+ TABLE*/
+--------------------------
+--Denominator, Numerator and Outcome(%)
+drop table if EXISTS #ASCOF_3D_Clients_65Over_FINAL
+select a.LA_CODE, a.[65Over_Denom], b.[3D1a_65Over_Num], c.[3D2a_65Over_Num]
+,ROUND(CAST(b.[3D1a_65Over_Num] AS Decimal) / CAST(a.[65Over_Denom] AS Decimal) * 100,1) as '3D1a_65Over_Outcome'
+,ROUND(CAST(c.[3D2a_65Over_Num] AS Decimal) / CAST(a.[65Over_Denom] AS Decimal) * 100,1) as '3D2a_65Over_Outcome'
+into #ASCOF_3D_Clients_65Over_FINAL
+from #ASCOF_3D_Clients_65Over_DENOM a
+left join #ASCOF_3D1a_65Over_NUM b on a.LA_CODE = b.LA_CODE
+left join #ASCOF_3D2a_65Over_NUM c on a.LA_CODE = c.LA_CODE
+group by a.LA_CODE, a.[65Over_Denom], b.[3D1a_65Over_Num], c.[3D2a_65Over_Num]
+,ROUND(CAST(b.[3D1a_65Over_Num] AS Decimal) / CAST(a.[65Over_Denom] AS Decimal) * 100,1)
+,ROUND(CAST(c.[3D2a_65Over_Num] AS Decimal) / CAST(a.[65Over_Denom] AS Decimal) * 100,1)
+;
+
+
+
+
+--------------------------------
+/*TOTAL ALL AGES INITIAL BUILD*/
+--------------------------------
+/*Create raw All Ages table*/
+drop table if EXISTS #ASCOF_3D_Clients_Total
+select *
+into #ASCOF_3D_Clients_Total
+from #ASCOF_3D_Clients_Join
+;
+
+
+/*Choose the record with the lowest 'Rank' in Service_Type/Delivery_Mech Hierarchy as per the REF data*/
+drop table if EXISTS #ASCOF_3D_Clients_Total_MinRank
+SELECT LA_Code, [ID],  Min(Hierarchy) as [RANK]
+into #ASCOF_3D_Clients_Total_MinRank
+FROM #ASCOF_3D_Clients_Total
+GROUP BY LA_Code, [ID]
+;
+
+
+/*Select these records into the 'Build' table*/
+drop table if EXISTS #ASCOF_3D_Clients_Total_Build
+SELECT a.LA_Code, a.[ID], a.Service_Type, a.Service_Component, a.[Delivery_Mechanism]
+into #ASCOF_3D_Clients_Total_Build
+from #ASCOF_3D_Clients_Total a
+left join #ASCOF_3D_Clients_Total_MinRank b on a.[ID] = b.[ID] and a.[Hierarchy] = b.[RANK]
+where b.[RANK] is not NULL
+group by a.LA_Code, a.[ID], a.Service_Type, a.Service_Component,  a.[Delivery_Mechanism]
+;
+
+
+
+----------------------------
+/*CREATE Total DENOMINATOR*/
+----------------------------
+--Filter for Community based only, now each Client with multiple settings as at the snapshot date has been de-duplicated 
+drop table if EXISTS #ASCOF_3D_Clients_Total_DENOM
+select LA_CODE, count(distinct [ID]) as [Total_Denom]
+into #ASCOF_3D_Clients_Total_DENOM
+from #ASCOF_3D_Clients_Total_Build
+where Service_Type = 'Long Term Support: Community'
+group by LA_CODE
+;
+
+
+
+-------------------------
+/*CREATE Total NUMERATORS*/
+-------------------------
+
+--3D Part 1a: Self-Directed Support
+--Choose all Community clients receiving self-directed support (Direct Payment or a CASSR Managed Personal Budget)
+--Delivery Mechanism and Service Component are used here to ensure full coverage (Delivery Mechanism is not a mandatory field)
+drop table if EXISTS #ASCOF_3D1a_Total_NUM
+select LA_CODE, count(distinct [ID]) as [3D1a_Total_Num]
+into #ASCOF_3D1a_Total_NUM
+from #ASCOF_3D_Clients_Total_Build
+where Service_Type = 'Long Term Support: Community'
+and (([Delivery_Mechanism] = 'Direct Payment' or [Service_Component] = 'Direct Payment') or ([Delivery_Mechanism] = 'CASSR Managed Personal Budget'))
+group by LA_CODE
+;
+
+
+
+--3D Part 2a: Direct Payment
+--Choose all Community clients receiving a Direct Payment
+--Delivery Mechanism and Service Component are used here to ensure full coverage (Delivery Mechanism is not a mandatory field)
+drop table if EXISTS #ASCOF_3D2a_Total_NUM
+select LA_CODE, count(distinct [ID]) as [3D2a_Total_Num]
+into #ASCOF_3D2a_Total_NUM
+from #ASCOF_3D_Clients_Total_Build
+where Service_Type = 'Long Term Support: Community'
+and ([Delivery_Mechanism] = 'Direct Payment' or [Service_Component] = 'Direct Payment')
+group by LA_CODE
+;
+
+
+
+--------------------------
+/*CREATE FINAL Total TABLE*/
+--------------------------
+--Denominator, Numerator and Outcome(%)
+drop table if EXISTS #ASCOF_3D_Clients_Total_FINAL
+select a.LA_CODE, a.[Total_Denom], b.[3D1a_Total_Num], c.[3D2a_Total_Num]
+,ROUND(CAST(b.[3D1a_Total_Num] AS Decimal) / CAST(a.[Total_Denom] AS Decimal) * 100,1) as '3D1a_Total_Outcome'
+,ROUND(CAST(c.[3D2a_Total_Num] AS Decimal) / CAST(a.[Total_Denom] AS Decimal) * 100,1) as '3D2a_Total_Outcome'
+into #ASCOF_3D_Clients_Total_FINAL
+from #ASCOF_3D_Clients_Total_DENOM a
+left join #ASCOF_3D1a_Total_NUM b on a.LA_CODE = b.LA_CODE
+left join #ASCOF_3D2a_Total_NUM c on a.LA_CODE = c.LA_CODE
+group by a.LA_CODE, a.[Total_Denom], b.[3D1a_Total_Num], c.[3D2a_Total_Num]
+,ROUND(CAST(b.[3D1a_Total_Num] AS Decimal) / CAST(a.[Total_Denom] AS Decimal) * 100,1)
+,ROUND(CAST(c.[3D2a_Total_Num] AS Decimal) / CAST(a.[Total_Denom] AS Decimal) * 100,1)
+;
+
+
+
+
+
+--------------------------------------------------------------------------------------------------------------------------
+/*CARERS MEASURES*/
+--------------------------------------------------------------------------------------------------------------------------
+
+
+
+DECLARE
+  @StartDate DATE,
+  @EndDate DATE
+;
+
+SET @StartDate = '2023-04-01' --Period of interest Start Date
+SET @EndDate = '2023-12-31' --Period of interest End Date
+;
+
+drop table if EXISTS #ASCOF_3D_Carers
+SELECT a.* 
+--Derive DOB using 1st month as an arbitrary date. NULLs defaulted to 01/01/1800, so they can be identified in the outputs
+,CASE WHEN (Der_Birth_Year is NULL or Der_Birth_Year is NULL) then CAST (('1800-01-01') as DATE)
+ELSE CAST((concat(Der_Birth_Year, '-', Der_Birth_Month, '-', '01')) as DATE) END as [Der_DOB]
+--
+-- Derive age as at period end, using Der_DOB. NULLs defaulted to 01/01/1800, so they can be identified in the outputs
+,CASE WHEN (Der_Birth_Year is NULL or Der_Birth_Year is NULL) then FLOOR((DATEDIFF(DAY,'1800-01-01', @EndDate)/365.25))
+ELSE FLOOR((DATEDIFF (DAY, (CAST(concat(Der_Birth_Year, '-', Der_Birth_Month, '-', '01') as DATE)), @EndDate))/365.25) END as [Der_Age_EndDate]
+--
+INTO #ASCOF_3D_Carers                                                                                                                                                 
+FROM [DHSC_ASC].[CLD_R1_Raw] a
+inner join #Latest_Submission b on a.LA_Name = b.LA_Name and a.ImportDate = b.ImportDate -- Only take latest (i.e. Final) submission within period of interest
+WHERE Client_Type in ('Carer', 'Carer known by association')                                                                                                                           
+AND Event_Start_Date <= @EndDate
+and (Event_End_Date >= @StartDate or Event_End_Date is NULL)
+AND (Date_of_Death >= @StartDate OR Date_of_Death is NULL)
+AND Event_Type in ('Request', 'Assessment', 'Service', 'Review')
+AND
+--three bespoke combinations of Event scenarios below are allowed to make up the Carers cohort as per LTS003. Only valid Service Types and Event Types will come 
+--through although Invalid Event Outcomes will still be permitted in cases where they aren't used to filter the data
+(
+(Service_Type is NULL AND Event_Outcome = 'NFA - Information & Advice / Signposting only')
+OR (Service_Type = 'Carer Support: Direct to Carer' or Service_Type = 'Carer Support: Support involving the person cared-for')
+OR ((Event_Type = 'Assessment' or Event_Type = 'Review') and Service_Type is NULL)
+)
+;
+
+
+
+
+----------------------------------------
+/*CREATE AMALGAMATED NHS/LA IDENTIFIER*/
+----------------------------------------
+
+/*Process used to create unique person ID, taking the NHS Number wherever possible and then deferring to the LA ID to back-fill NHS Number gaps wherever possible*/
+
+/*initially, find all individuals with an NHS Number and stage into a temporary table*/                               
+drop table if exists #uniquenhs
+SELECT DISTINCT Der_Unique_Record_ID, Der_NHS_Number_Traced_Pseudo, Der_LA_Person_Unique_Identifier_Pseudo, 'NHS' as [Source]                                                                                                                                                     
+INTO #uniquenhs                                                                                                                                                           
+FROM #ASCOF_3D_Carers                                                                                                                                                 
+where Der_NHS_Number_Traced_Pseudo is not NULL                                                                                          
+;
+
+
+
+/*where the NHS Number is missing, pull through all individuals LA Unique ID
+except in those cases where the LA Unique ID is already present and associated with an individual in #uniquenhs*/
+drop table if exists #missingnhs
+SELECT distinct a.Der_Unique_Record_ID, a.Der_NHS_Number_Traced_Pseudo, a.Der_LA_Person_Unique_Identifier_Pseudo, 'LA' as [Source]                                                                             
+INTO #missingnhs                                                                                                                                                           
+FROM #ASCOF_3D_Carers a                                                                                                                                                
+left join #uniquenhs b on a.Der_LA_Person_Unique_Identifier_Pseudo = b.Der_LA_Person_Unique_Identifier_Pseudo                                                                                                          
+where a.Der_NHS_Number_Traced_Pseudo is NULL                                                                                              
+and b.Der_LA_Person_Unique_Identifier_Pseudo is NULL                                                                                     
+;
+
+
+/*Stack the NHS IDs and the LA IDs from the two temp tables underneath each other in a final table, as an amalgamated 'ID' field*/
+drop table if exists #FINAL
+select distinct Der_Unique_Record_ID, Der_NHS_Number_Traced_Pseudo as [ID], [Source]                                     
+into #FINAL                                                                                                                                                                     
+from #uniquenhs                                                                                                                                                           
+UNION                                                                                                                                                               
+select distinct Der_Unique_Record_ID, Der_LA_Person_Unique_Identifier_Pseudo as [ID], [Source]                        
+from #missingnhs
+;
+
+
+/*Add a column to Raw table with the new ID field*/
+alter table #ASCOF_3D_Carers add [ID] nvarchar (200)
+GO
+;
+update a
+set a.[ID] = b.[ID]
+from #ASCOF_3D_Carers a left join #FINAL b on a.Der_Unique_Record_ID = b.Der_Unique_Record_ID
+;
+
+/*delete rows from table where [ID] is NULL
+These records can not be assigned to an individual with 100% accuracy and without the risk of double-counting 
+as the NHS ID is NULL and the LA ID is already present in the data associated to an NHS Number*/
+delete from #ASCOF_3D_Carers
+where [ID] is NULL
+;
+
+--------------------------------------------------------------------------------------------------------------
+
+--------------------------------------------
+/*CASE CARER OUTCOMES INTO SALT CATEGORIES*/
+--------------------------------------------
+/*The specific scenarios detailed in the initial #ASCOF_3D_CARERS table build are now CASED into the SALT LTS003 buckets
+so they can be de-duplicated and the Carers feeding into the ASCOF Numerator and Denominators reflect LTS003 methodology
+The CASE statement here differs slightly from the corresponding section of the LTS003 code, as Service Component = 'Direct Payment' 
+is also captured here in order to try and capture as many Direct Payment instances as possible and avoid under-counting the Numerators 
+and Denominator for 3D. Same rationale is applied to the Client-based parts of the measure (3D1a and 3D2a)
+
+NOTE: Ensure periodically that the wording of the CLD Specification Defined Lists has not changed, in order that the CASE continues
+to work as expected
+
+Process below is written as a CASE in lieu of a #REF table not being possible to implement - too many different fields are used to inform the
+building of the Support Provided column, with many permutations possible, which would require a v large REF table. Once given a 'Support Provided' 
+entry based on the CASE below, these are then mapped to a small REF table to attribute a 'Rank' to each type of Support Provided
+*/
+drop table if exists #ASCOF_3D_Carers_Case
+select *,
+CASE 
+WHEN Service_Type = 'Carer Support: Direct to Carer' and (Delivery_Mechanism = 'Direct Payment' or Service_Component = 'Direct Payment') THEN 'Direct Payment only'
+WHEN Service_Type = 'Carer Support: Direct to Carer' and (Delivery_Mechanism = 'CASSR Managed Personal Budget' and Service_Component not like 'Direct Payment') THEN 'CASSR Managed Personal Budget'
+WHEN Service_Type = 'Carer Support: Direct to Carer' and (Delivery_Mechanism = 'CASSR Commissioned support' and Service_Component not like 'Direct Payment') THEN 'CASSR Commissioned Support only'
+WHEN Service_Type = 'Carer Support: Direct to Carer' and (Delivery_Mechanism not in  ('Direct Payment', 'CASSR Managed Personal Budget', 'CASSR Commissioned support') and Service_Component not like 'Direct Payment') THEN 'Support Direct to Carer: Unknown Delivery Mech'
+WHEN Service_Type = 'Carer Support: Direct to Carer' and (Delivery_Mechanism is NULL and Service_Component not like 'Direct Payment') THEN 'Support Direct to Carer: Unknown Delivery Mech'
+WHEN Service_Type = 'Carer Support: Support involving the person cared-for' THEN 'No Direct Support Provided to Carer'
+WHEN Event_Type in ('Assessment', 'Review') and Event_Outcome not like 'NFA - Information & Advice / Signposting only' THEN 'No Direct Support Provided to Carer'
+WHEN Event_Type in ('Assessment', 'Review') and Event_Outcome is NULL THEN 'No Direct Support Provided to Carer'
+WHEN Event_Type in ('Assessment', 'Review') and Event_Outcome = 'NFA - Information & Advice / Signposting only' THEN 'Information, Advice and Other Universal Services / Signposting'
+WHEN Event_Type = 'Request' THEN 'Information, Advice and Other Universal Services / Signposting'
+END as 'Support_Provided'
+into #ASCOF_3D_Carers_Case
+from #ASCOF_3D_Carers
+;
+
+
+--------------------
+/*JOIN TO REF DATA*/
+--------------------
+/*Join the Carers data to the Hierarchy reference data, in order to de-duplicate Carers appearing more than once with conflicting support types*/
+drop table if exists #ASCOF_3D_Carers_JOIN
+select a.*, b.Hierarchy
+into #ASCOF_3D_Carers_JOIN
+from #ASCOF_3D_Carers_Case a
+left join #REF_CARER_SUPPORT_HIERARCHY b on a.Support_Provided = b.Support_Provided
+;
+
+
+----------------
+/*DE-DUPLICATE*/
+----------------
+/*Pull out lowest Hierarchy / 'RANK' in instances where a Carer appears more than once within the period of interest and pull through the
+'Support_Provided' field containing the SALT support categories.
+Age information will need to be pulled through here but user needs to be aware that this may introduce duplicates (i.e. same Carer with different ages) 
+due to DQ issues. These will need to be pin-pointed and de-duplicated somehow to maintain unique headcounts*/
+drop table if exists #ASCOF_3D_Carers_MinRank
+select distinct a.LA_CODE
+, a.[ID]
+, a.Support_Provided
+, a.Der_Age_EndDate
+into #ASCOF_3D_Carers_MinRank
+from #ASCOF_3D_Carers_JOIN a
+inner join
+(
+SELECT LA_Code, [ID], Min(Hierarchy) as [RANK]
+FROM #ASCOF_3D_Carers_JOIN
+GROUP BY LA_Code, [ID]
+) b
+on a.LA_CODE = b.LA_CODE and a.[ID] = b.[ID] and a.Hierarchy = b.[RANK]
+;
+
+
+
+----------------------------
+/*AGED 18-64 INITIAL BUILD*/
+----------------------------
+/*Create raw 18-64 table and add relevant fields from Reference data*/
+drop table if EXISTS #ASCOF_3D_Carers_1864
+select a.*
+into #ASCOF_3D_Carers_1864
+from #ASCOF_3D_Carers_MinRank a
+where Der_Age_EndDate between 18 and 64
+
+
+----------------------------
+/*CREATE 18-64 DENOMINATOR*/
+----------------------------
+--Filter for the three support types with the 'Support Direct To Carer' Service Type that is in scope for the ASCOF Denominator
+drop table if EXISTS #ASCOF_3D_Carers_1864_DENOM
+select LA_CODE, count(distinct [ID]) as [1864_Denom]
+into #ASCOF_3D_Carers_1864_DENOM
+from #ASCOF_3D_Carers_1864
+where Support_Provided in  ('Direct Payment only', 'CASSR Managed Personal Budget', 'CASSR Commissioned Support only')
+group by LA_CODE
+;
+
+
+
+---------------------------
+/*CREATE 18-64 NUMERATORS*/
+---------------------------
+
+--3D Part 1b: Self-Directed Support
+--Choose all Carers receiving self-directed support (Direct Payment or a CASSR Managed Personal Budget)
+drop table if EXISTS #ASCOF_3D1b_1864_NUM
+select LA_CODE, count(distinct [ID]) as [3D1b_1864_Num]
+into #ASCOF_3D1b_1864_NUM
+from #ASCOF_3D_Carers_1864
+where Support_Provided in  ('Direct Payment only', 'CASSR Managed Personal Budget')
+group by LA_CODE
+;
+
+
+--3D Part 2b: Direct Payment
+--Choose all Carers receiving receiving a Direct Payment
+drop table if EXISTS #ASCOF_3D2b_1864_NUM
+select LA_CODE, count(distinct [ID]) as [3D2b_1864_Num]
+into #ASCOF_3D2b_1864_NUM
+from #ASCOF_3D_Carers_1864
+where Support_Provided in  ('Direct Payment only')
+group by LA_CODE
+;
+
+
+
+----------------------------
+/*CREATE FINAL 18-64 TABLE*/
+----------------------------
+--Denominator, Numerator and Outcome(%)
+drop table if EXISTS #ASCOF_3D_Carers_1864_FINAL
+select a.LA_CODE, a.[1864_Denom], b.[3D1b_1864_Num], c.[3D2b_1864_Num]
+,ROUND(CAST(b.[3D1b_1864_Num] AS Decimal) / CAST(a.[1864_Denom] AS Decimal) * 100,1) as '3D1b_1864_Outcome'
+,ROUND(CAST(c.[3D2b_1864_Num] AS Decimal) / CAST(a.[1864_Denom] AS Decimal) * 100,1) as '3D2b_1864_Outcome'
+into #ASCOF_3D_Carers_1864_FINAL
+from #ASCOF_3D_Carers_1864_DENOM a
+left join #ASCOF_3D1b_1864_NUM b on a.LA_CODE = b.LA_CODE
+left join #ASCOF_3D2b_1864_NUM c on a.LA_CODE = c.LA_CODE
+group by a.LA_CODE, a.[1864_Denom], b.[3D1b_1864_Num], c.[3D2b_1864_Num]
+,ROUND(CAST(b.[3D1b_1864_Num] AS Decimal) / CAST(a.[1864_Denom] AS Decimal) * 100,1)
+,ROUND(CAST(c.[3D2b_1864_Num] AS Decimal) / CAST(a.[1864_Denom] AS Decimal) * 100,1)
+;
+
+
+
+
+----------------------------
+/*AGED 65+ INITIAL BUILD*/
+----------------------------
+/*Create raw 65+ table and add relevant fields from Reference data
+NOTE: Filter here is designed to remove those Carers with an unknown age that were defaulted to 01/01/1800 */
+drop table if EXISTS #ASCOF_3D_Carers_65Over
+select a.*
+into #ASCOF_3D_Carers_65Over
+from #ASCOF_3D_Carers_MinRank a
+where Der_Age_EndDate between 65 and 200
+
+
+
+----------------------------
+/*CREATE 65+ DENOMINATOR*/
+----------------------------
+--Filter for the three support types with the 'Support Direct To Carer' Service Type that is in scope for the ASCOF Denominator
+drop table if EXISTS #ASCOF_3D_Carers_65Over_DENOM
+select LA_CODE, count(distinct [ID]) as [65Over_Denom]
+into #ASCOF_3D_Carers_65Over_DENOM
+from #ASCOF_3D_Carers_65Over
+where Support_Provided in  ('Direct Payment only', 'CASSR Managed Personal Budget', 'CASSR Commissioned Support only')
+group by LA_CODE
+;
+
+
+
+---------------------------
+/*CREATE 65+ NUMERATORS*/
+---------------------------
+
+--3D Part 1b: Self-Directed Support
+--Choose all Carers receiving self-directed support (Direct Payment or a CASSR Managed Personal Budget)
+drop table if EXISTS #ASCOF_3D1b_65Over_NUM
+select LA_CODE, count(distinct [ID]) as [3D1b_65Over_Num]
+into #ASCOF_3D1b_65Over_NUM
+from #ASCOF_3D_Carers_65Over
+where Support_Provided in  ('Direct Payment only', 'CASSR Managed Personal Budget')
+group by LA_CODE
+;
+
+
+
+--3D Part 2b: Direct Payment
+--Choose all Carers receiving receiving a Direct Payment
+drop table if EXISTS #ASCOF_3D2b_65Over_NUM
+select LA_CODE, count(distinct [ID]) as [3D2b_65Over_Num]
+into #ASCOF_3D2b_65Over_NUM
+from #ASCOF_3D_Carers_65Over
+where Support_Provided in  ('Direct Payment only')
+group by LA_CODE
+;
+
+
+
+----------------------------
+/*CREATE FINAL 65+ TABLE*/
+----------------------------
+--Denominator, Numerator and Outcome(%)
+drop table if EXISTS #ASCOF_3D_Carers_65Over_FINAL
+select a.LA_CODE, a.[65Over_Denom], b.[3D1b_65Over_Num], c.[3D2b_65Over_Num]
+,ROUND(CAST(b.[3D1b_65Over_Num] AS Decimal) / CAST(a.[65Over_Denom] AS Decimal) * 100,1) as '3D1b_65Over_Outcome'
+,ROUND(CAST(c.[3D2b_65Over_Num] AS Decimal) / CAST(a.[65Over_Denom] AS Decimal) * 100,1) as '3D2b_65Over_Outcome'
+into #ASCOF_3D_Carers_65Over_FINAL
+from #ASCOF_3D_Carers_65Over_DENOM a
+left join #ASCOF_3D1b_65Over_NUM b on a.LA_CODE = b.LA_CODE
+left join #ASCOF_3D2b_65Over_NUM c on a.LA_CODE = c.LA_CODE
+group by a.LA_CODE, a.[65Over_Denom], b.[3D1b_65Over_Num], c.[3D2b_65Over_Num]
+,ROUND(CAST(b.[3D1b_65Over_Num] AS Decimal) / CAST(a.[65Over_Denom] AS Decimal) * 100,1)
+,ROUND(CAST(c.[3D2b_65Over_Num] AS Decimal) / CAST(a.[65Over_Denom] AS Decimal) * 100,1)
+;
+
+
+
+
+
+----------------------------
+/*TOTAL INITIAL BUILD*/
+----------------------------
+/*
+Create raw All Ages table and add relevant fields from Reference data
+NOTE: Age Under 18 still excluded as per current NHSE/DHSC agreement
+This cohort will include the Unknown ages defaulted to 01/01/1800 at beginning of process
+*/
+drop table if EXISTS #ASCOF_3D_Carers_Total
+select a.*
+into #ASCOF_3D_Carers_Total
+from #ASCOF_3D_Carers_MinRank a
+where Der_Age_EndDate > 17
+
+
+----------------------------
+/*CREATE TOTAL DENOMINATOR*/
+----------------------------
+--Filter for the three support types with the 'Support Direct To Carer' Service Type that is in scope for the ASCOF Denominator
+drop table if EXISTS #ASCOF_3D_Carers_Total_DENOM
+select LA_CODE, count(distinct [ID]) as [Total_Denom]
+into #ASCOF_3D_Carers_Total_DENOM
+from #ASCOF_3D_Carers_Total
+where Support_Provided in  ('Direct Payment only', 'CASSR Managed Personal Budget', 'CASSR Commissioned Support only')
+group by LA_CODE
+;
+
+
+
+---------------------------
+/*CREATE TOTAL NUMERATORS*/
+---------------------------
+
+--3D Part 1b: Self-Directed Support
+--Choose all Carers receiving self-directed support (Direct Payment or a CASSR Managed Personal Budget)
+drop table if EXISTS #ASCOF_3D1b_Total_NUM
+select LA_CODE, count(distinct [ID]) as [3D1b_Total_Num]
+into #ASCOF_3D1b_Total_NUM
+from #ASCOF_3D_Carers_Total
+where Support_Provided in  ('Direct Payment only', 'CASSR Managed Personal Budget')
+group by LA_CODE
+;
+
+
+
+--3D Part 2b: Direct Payment
+--Choose all Carers receiving receiving a Direct Payment
+drop table if EXISTS #ASCOF_3D2b_Total_NUM
+select LA_CODE, count(distinct [ID]) as [3D2b_Total_Num]
+into #ASCOF_3D2b_Total_NUM
+from #ASCOF_3D_Carers_Total
+where Support_Provided in  ('Direct Payment only')
+group by LA_CODE
+;
+
+
+
+----------------------------
+/*CREATE TOTAL 65+ TABLE*/
+----------------------------
+--Denominator, Numerator and Outcome(%)
+drop table if EXISTS #ASCOF_3D_Carers_Total_FINAL
+select a.LA_CODE, a.[Total_Denom], b.[3D1b_Total_Num], c.[3D2b_Total_Num]
+,ROUND(CAST(b.[3D1b_Total_Num] AS Decimal) / CAST(a.[Total_Denom] AS Decimal) * 100,1) as '3D1b_Total_Outcome'
+,ROUND(CAST(c.[3D2b_Total_Num] AS Decimal) / CAST(a.[Total_Denom] AS Decimal) * 100,1) as '3D2b_Total_Outcome'
+into #ASCOF_3D_Carers_Total_FINAL
+from #ASCOF_3D_Carers_Total_DENOM a
+left join #ASCOF_3D1b_Total_NUM b on a.LA_CODE = b.LA_CODE
+left join #ASCOF_3D2b_Total_NUM c on a.LA_CODE = c.LA_CODE
+group by a.LA_CODE, a.[Total_Denom], b.[3D1b_Total_Num], c.[3D2b_Total_Num]
+,ROUND(CAST(b.[3D1b_Total_Num] AS Decimal) / CAST(a.[Total_Denom] AS Decimal) * 100,1)
+,ROUND(CAST(c.[3D2b_Total_Num] AS Decimal) / CAST(a.[Total_Denom] AS Decimal) * 100,1)
+;
+
+
+
+
+
+
+------------------------------
+/*CREATE FINAL ASCOF 3D ASSET*/
+-------------------------------
+--Final ASCOF 3D table with all Denominators, Numerators and Outcome(%)
+--Total (all ages), Ages 18-64 and Ages 65 and over for both CLIENTS and CARERS
+
+--Columns can be removed as appropriate (e.g. if only Totals needed for each measure, without the age breakdowns)
+drop table if EXISTS #ASCOF_3D
+select a.LA_CODE
+, a.[Total_Denom] as 'Total_Client_Denom', a.[3D1a_Total_Num], a.[3D1a_Total_Outcome], a.[3D2a_Total_Num], a.[3D2a_Total_Outcome]
+, b.[1864_Denom] as '1864_Client_Denom', b.[3D1a_1864_Num], b.[3D1a_1864_Outcome], b.[3D2a_1864_Num], b.[3D2a_1864_Outcome] 
+, c.[65Over_Denom] as '65Over_Client_Denom', c.[3D1a_65Over_Num], c.[3D1a_65Over_Outcome], c.[3D2a_65Over_Num], c.[3D2a_65Over_Outcome]
+, d.[Total_Denom] as 'Total_Carer_Denom', d.[3D1b_Total_Num], d.[3D1b_Total_Outcome], d.[3D2b_Total_Num], d.[3D2b_Total_Outcome]
+, e.[1864_Denom] as '1864_Carer_Denom', e.[3D1b_1864_Num], e.[3D1b_1864_Outcome], e.[3D2b_1864_Num], e.[3D2b_1864_Outcome] 
+, f.[65Over_Denom] as '65Over_Carer_Denom', f.[3D1b_65Over_Num], f.[3D1b_65Over_Outcome], f.[3D2b_65Over_Num], f.[3D2b_65Over_Outcome]
+into #ASCOF_3D
+from #ASCOF_3D_Clients_Total_FINAL a
+left join #ASCOF_3D_Clients_1864_FINAL b on a.LA_CODE = b.LA_CODE
+left join #ASCOF_3D_Clients_65Over_FINAL c on a.LA_CODE = c.LA_CODE
+left join #ASCOF_3D_Carers_Total_FINAL d on a.LA_CODE = d.LA_CODE
+left join #ASCOF_3D_Carers_1864_FINAL e on a.LA_CODE = e.LA_CODE
+left join #ASCOF_3D_Carers_65Over_FINAL f on a.LA_CODE = f.LA_CODE
+group by a.LA_CODE
+, a.[Total_Denom], a.[3D1a_Total_Num], a.[3D1a_Total_Outcome], a.[3D2a_Total_Num], a.[3D2a_Total_Outcome]
+, b.[1864_Denom], b.[3D1a_1864_Num], b.[3D1a_1864_Outcome], b.[3D2a_1864_Num], b.[3D2a_1864_Outcome] 
+, c.[65Over_Denom], c.[3D1a_65Over_Num], c.[3D1a_65Over_Outcome], c.[3D2a_65Over_Num], c.[3D2a_65Over_Outcome]
+, d.[Total_Denom], d.[3D1b_Total_Num], d.[3D1b_Total_Outcome], d.[3D2b_Total_Num], d.[3D2b_Total_Outcome]
+, e.[1864_Denom], e.[3D1b_1864_Num], e.[3D1b_1864_Outcome], e.[3D2b_1864_Num], e.[3D2b_1864_Outcome] 
+, f.[65Over_Denom], f.[3D1b_65Over_Num], f.[3D1b_65Over_Outcome], f.[3D2b_65Over_Num], f.[3D2b_65Over_Outcome]
+;
+
+
+
+
+select *
+from #ASCOF_3D
