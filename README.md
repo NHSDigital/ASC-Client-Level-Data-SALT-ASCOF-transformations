@@ -13,9 +13,14 @@
 #### The codes are intended to replicate (wherever possible) the metrics previously captured in the Short and Long Term Support (SALT) collection, using the Client Level Data, where there is an ongoing need for this insight. The code processes have been written to be as true to the original principles of SALT as possible and filter, process, de-duplicate and aggregate the data in a way that closest matches SALT.
 
 
-## How to apply them
+## Prerequisites
 
-#### The codes were developed by NHS England using the access to the AGEM CLD Repository and as such the labels used reflect this (Database names, table names, field names). The principles of the base code should, however, be transferable once adjustments to these labels are made.
+#### Codes are stored as txt files, which can be pasted into an instance of SQL Server Management Studio. The codes were developed by NHS England using the access to the AGEM CLD Repository and as such the labels used reflect this (Database names, table names, field names). These labels will need to be changed according to local naming conventions and an existing connection to to Client Level Data is required. The principles of the base code should, however, be transferable once adjustments to these labels are made.
+
+
+## Known Limitations
+
+#### As a new data collection, with a change in the underlying source, metrics derived from CLD are not expected to perfectly match those from SALT (and a small number of fields collected and used in SALT were not carried over to the CLD specification). However, the approach outlined is intended to stay in line with principles adopted by SALT. See the individual Notes and Limitations associated with each measure for more specific information.
 
 
 ## Known Limitations
