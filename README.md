@@ -12,6 +12,8 @@
 
 #### The codes are intended to replicate (wherever possible) the metrics previously captured in the Short and Long Term Support (SALT) collection, using the Client Level Data, where there is an ongoing need for this insight. The code processes have been written to be as true to the original principles of SALT as possible and filter, process, de-duplicate and aggregate the data in a way that closest matches SALT.
 
+#### NOTE: We don't anticpate the need to amend or re-draft these codes in this specific repository
+
 
 ## Prerequisites
 
