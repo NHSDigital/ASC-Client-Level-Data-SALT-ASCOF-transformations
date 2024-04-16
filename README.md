@@ -10,9 +10,9 @@
 
 ## What is the purpose of these SQL codes?
 
-#### The codes are intended to replicate (wherever possible) the metrics previously captured in the Short and Long Term Support (SALT) collection, using the Client Level Data, where there is an ongoing need for this insight. The code processes have been written to be as true to the original principles of SALT as possible and filter, process, de-duplicate and aggregate the data in a way that closest matches SALT.
+#### The codes are intended to replicate (wherever possible) the metrics previously captured in the Short and Long Term Support (SALT) collection, using the Client Level Data, where there is an ongoing need for this insight. The code processes have been written to be as true to the original principles of SALT as possible and filter, process, de-duplicate and aggregate the data in a way that closest matches SALT and provides transparency on how these figures will be calculated centrally, or how users accessing data through the Data Access Request Service could recreate these locally. 
 
-#### NOTE: We don't anticipate the need to amend or re-draft these codes in this specific repository
+#### Methods were developed in collaboration with local authority and DHSC analysts on our CLD SALT metrics reference group, and made available to all local authorities for feedback which has been reviewed and incorporated where applicable. This document now reflects the approaches that will be used when comparing SALT with CLD equivalents for 2023/24. 2023/24 is the last year of SALT data collection and so the content of this code is now fixed and will not be subject to any further rounds of feedback or changes.
 
 
 ## Prerequisites
